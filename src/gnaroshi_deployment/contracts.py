@@ -8,11 +8,43 @@ from typing import Protocol
 import numpy as np
 
 
+def _failure_value(value):
+    """Fault evidence must remain writable even when a command contains NaN."""
+    if isinstance(value, dict):
+        return {str(key): _failure_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_failure_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return _failure_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _failure_value(value.item())
+    if isinstance(value, float) and not np.isfinite(value):
+        return {"invalid_numeric": repr(value)}
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    return repr(value)
+
+
 class RobotRecoveryRequired(RuntimeError):
     """A typed device fault requiring an explicit, motion-free operator recovery."""
-    def __init__(self, reason: str, *, status: dict | None = None):
+    def __init__(self, reason: str, *, status: dict | None = None, category: str = "robot_fault"):
         super().__init__(reason)
-        self.status = dict(status or {})
+        self.category = category
+        self.status = _failure_value(dict(status or {}))
+
+    def asdict(self):
+        return {"category": self.category, "message": str(self), "status": self.status}
+
+
+class RobotActionError(ValueError):
+    """Invalid policy command; recording a failure must not permit robot recovery."""
+    def __init__(self, reason: str, *, status: dict | None = None, category: str = "invalid_action"):
+        super().__init__(reason)
+        self.category = category
+        self.status = _failure_value(dict(status or {}))
+
+    def asdict(self):
+        return {"category": self.category, "message": str(self), "status": self.status}
 
 
 @dataclass
@@ -80,6 +112,9 @@ class Embodiment(Protocol):
     apply must check that latch inside the same lock used to issue a command.
     stop is callable from a separate operator thread. All other hardware calls
     are serialized on the session worker. home is cancellable and bounded.
+    Optional home_idle(cancel) moves only the arm to the project home, preserving
+    the gripper position/activation. Explicit idle Home prefers this method;
+    home remains the Start/outcome preparation operation.
     connect opens sensors/control but never homes or calibrates the gripper.
     Optional recover(cancel) verifies fresh healthy state and acknowledged stop,
     returning {"healthy": True, "stop_confirmed": True, ...}. It never unlocks,

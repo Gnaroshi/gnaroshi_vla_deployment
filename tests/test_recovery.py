@@ -161,9 +161,9 @@ class RecoverySessions(unittest.TestCase):
         session.signal("stop")
         self.wait(lambda: session.state == "RECOVERY_REQUIRED" and session.can_recover)
         self.assertEqual((session.policy.connect_calls, session.policy.close_calls), (1, 0))
-        self.assertEqual(session.results, [])
+        self.assertEqual([row["outcome"] for row in session.results], ["failure"])
         result = json.loads(next(session.folder.glob("rollout_*/result.json")).read_text())
-        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["outcome"], "failure")
         self.assertTrue(result["recovery_required"])
         embodiment.fail_stop = False
         embodiment.released = True
@@ -236,12 +236,12 @@ class RecoverySessions(unittest.TestCase):
         self.fault(session)
         self.assertTrue(session.worker.is_alive())
         self.assertEqual((session.policy.connect_calls, session.policy.close_calls), (1, 0))
-        self.assertEqual(session.results, [])
+        self.assertEqual([row["outcome"] for row in session.results], ["failure"])
         error_files = list(session.folder.glob("rollout_*/result.json"))
         self.assertEqual(len(error_files), 1)
         original = error_files[0].read_bytes()
         result = json.loads(original)
-        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["outcome"], "failure")
         self.assertTrue(result["recovery_required"])
         self.assertEqual(result["steps"], 3)
         self.assertTrue((error_files[0].parent/"steps.jsonl").exists())
@@ -267,7 +267,7 @@ class RecoverySessions(unittest.TestCase):
         self.wait(lambda: session.state == "RUNNING" and len(session.rows) >= 2)
         session.signal("failure")
         self.wait(lambda: session.state == "READY")
-        self.assertEqual([row["outcome"] for row in session.results], ["failure"])
+        self.assertEqual([row["outcome"] for row in session.results], ["failure", "failure"])
 
     def test_home_begin_and_observe_faults_do_not_destroy_worker(self):
         for phase in ("home", "begin", "observe"):
@@ -276,7 +276,7 @@ class RecoverySessions(unittest.TestCase):
                 self.fault(session, phase)
                 self.assertTrue(session.worker.is_alive())
                 self.assertEqual(session.policy.close_calls, 0)
-                self.assertEqual(session.results, [])
+                self.assertEqual([row["outcome"] for row in session.results], ["failure"])
                 self.assertFalse(session.start_rollout())
                 if phase != "observe":
                     self.assertEqual(len(list(session.folder.glob("rollout_*/result.json"))), 1)
@@ -374,7 +374,7 @@ class RecoverySessions(unittest.TestCase):
         self.assertFalse(session.recover_robot())
         self.assertEqual(session.policy.close_calls, 1)
         result = json.loads(next(session.folder.glob("rollout_*/result.json")).read_text())
-        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["outcome"], "failure")
         self.assertFalse(result["recovery_required"])
 
     def test_typed_stop_fault_at_max_steps_keeps_policy_for_recovery(self):
@@ -387,7 +387,7 @@ class RecoverySessions(unittest.TestCase):
         self.assertEqual(session.policy.close_calls, 0)
         self.assertEqual(len(session.rows), 3)
         result = json.loads(next(session.folder.glob("rollout_*/result.json")).read_text())
-        self.assertEqual(result["outcome"], "error")
+        self.assertEqual(result["outcome"], "failure")
         self.assertTrue(result["recovery_required"])
         embodiment.fail_stop = False
         embodiment.released = True

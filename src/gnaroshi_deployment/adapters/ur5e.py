@@ -10,7 +10,7 @@ import threading
 import time
 import importlib.metadata
 import numpy as np
-from ..contracts import Observation, RobotRecoveryRequired, action_vector
+from ..contracts import Observation, RobotActionError, RobotRecoveryRequired, action_vector
 
 
 @dataclass
@@ -165,27 +165,60 @@ class UR5eEmbodiment:
         with self._fault_lock:
             if self._fault is None:
                 return None
-            return RobotRecoveryRequired(self._fault["reason"], status=dict(self._fault["status"]))
+            return RobotRecoveryRequired(self._fault["reason"], status=dict(self._fault["status"]),
+                                         category=self._fault["category"])
 
-    def _fault_error(self,reason,status=None):
+    def _fault_error(self,reason,status=None,*,category="robot_fault"):
         self.armed.clear()
-        payload=dict(status or {})
+        payload=RobotRecoveryRequired(str(reason),status=status,category=category).status
         with self._fault_lock:
             if self._fault is None:
-                self._fault={"reason":str(reason),"status":dict(payload)}
-            payload["original_fault"]=self._fault
-            self.metadata["robot_fault"]={"reason":str(reason),"status":dict(payload)}
-        return RobotRecoveryRequired(str(reason),status=payload)
+                self._fault={"reason":str(reason),"category":category,"status":dict(payload)}
+            payload["original_fault"]={**self._fault,"status":dict(self._fault["status"])}
+            self.metadata["robot_fault"]={"reason":str(reason),"category":category,"status":dict(payload)}
+        return RobotRecoveryRequired(str(reason),status=payload,category=category)
+
+    def _failure_context(self,error,details):
+        """Keep the attempted command with a typed fault, without another device call."""
+        details=RobotRecoveryRequired(str(error),status=details,category=error.category).status
+        error.status={**details,**error.status}
+        with self._fault_lock:
+            if self._fault is not None:
+                # Do not put original_fault back into its own nested status.
+                # The inner servo evidence wins over outer apply defaults (for
+                # example an acknowledged command followed by a disconnect).
+                self._fault["status"].update({key:value for key,value in error.status.items()
+                                              if key!="original_fault"})
+            self.metadata["robot_fault"]={"reason":str(error),"category":error.category,
+                                          "status":dict(error.status)}
+        return error
+
+    def _driver_failure(self,reason,details,*,category,error=None):
+        """Prefer observed robot status to guesses about why a command failed."""
+        context=dict(details)
+        if error is not None:
+            context.update(driver_error=str(error),driver_error_type=type(error).__name__)
+        context.update(operation_failure=str(reason),operation_failure_category=category)
+        try:
+            self._require_status(self._read_status())
+        except RobotRecoveryRequired as fault:
+            return self._failure_context(fault,context)
+        return self._fault_error(reason,context,category=category)
 
     def _read_status(self):
         if self.receive is None or self.control is None:
-            raise self._fault_error("Robot control/receive connection is unavailable")
+            raise self._fault_error("Robot control/receive connection is unavailable",category="robot_disconnected")
+        status={}
         try:
             status={"receive_connected":bool(self.receive.isConnected()),
-                    "control_connected":bool(self.control.isConnected()),
-                    "safety_mode":int(self.receive.getSafetyMode()),
+                    "control_connected":bool(self.control.isConnected())}
+            if not status["receive_connected"] or not status["control_connected"]:
+                # Disconnected SDK feedback can be stale or raise. Preserve the
+                # direct connection result before requesting any cached state.
+                return status
+            status.update({"safety_mode":int(self.receive.getSafetyMode()),
                     "robot_mode":int(self.receive.getRobotMode()),
-                    "program_running":bool(self.control.isProgramRunning())}
+                    "program_running":bool(self.control.isProgramRunning())})
             for name,key in (("isProtectiveStopped","protective_stop"),("isEmergencyStopped","emergency_stop")):
                 method=getattr(self.receive,name,None)
                 status[key]=bool(method()) if callable(method) else status["safety_mode"] in ({3} if key=="protective_stop" else {6,7})
@@ -199,17 +232,28 @@ class UR5eEmbodiment:
         except RobotRecoveryRequired:
             raise
         except Exception as error:
-            raise self._fault_error("Robot safety/status query failed",{"driver_error":str(error)}) from error
+            category="robot_disconnected" if isinstance(error,ConnectionError) else "status_feedback_error"
+            raise self._fault_error("Robot safety/status query failed",{**status,"driver_error":str(error),
+                                      "driver_error_type":type(error).__name__},category=category) from error
 
     def _require_status(self,status,*,program=True):
         if not status["receive_connected"] or not status["control_connected"]:
-            raise self._fault_error("RTDE connection is disconnected; restore the robot connection before retrying",status)
-        if status["protective_stop"] or status["emergency_stop"] or status["safety_mode"] not in {1,2}:
-            raise self._fault_error("Robot is safety stopped; clear the reported condition on the teach pendant before Recover",status)
+            raise self._fault_error("RTDE connection is disconnected; restore the robot connection before retrying",status,
+                                    category="robot_disconnected")
+        if status["emergency_stop"]:
+            raise self._fault_error("Robot emergency stop is active; clear the reported condition on the teach pendant before Recover",status,
+                                    category="emergency_stop")
+        if status["protective_stop"]:
+            raise self._fault_error("Robot protective stop is active; clear the reported condition on the teach pendant before Recover",status,
+                                    category="protective_stop")
+        if status["safety_mode"] not in {1,2}:
+            raise self._fault_error("Robot is safety stopped; clear the reported condition on the teach pendant before Recover",status,
+                                    category="robot_safety_stop")
         if status["robot_mode"]!=7:
-            raise self._fault_error("Robot is not in RUNNING mode; restore it on the teach pendant before Recover",status)
+            raise self._fault_error("Robot is not in RUNNING mode; restore it on the teach pendant before Recover",status,
+                                    category="robot_not_ready")
         if program and not status["program_running"]:
-            raise self._fault_error("RTDE control program is not running",status)
+            raise self._fault_error("RTDE control program is not running",status,category="control_program_stopped")
         return status
 
     def _assert_robot_ready(self,context):
@@ -218,7 +262,8 @@ class UR5eEmbodiment:
         with self._fault_lock:
             fault=self._fault
         if fault is not None:
-            raise RobotRecoveryRequired(fault["reason"],status={**fault["status"],"context":context,"recovery_required":True})
+            raise RobotRecoveryRequired(fault["reason"],status={**fault["status"],"context":context,"recovery_required":True},
+                                         category=fault["category"])
         return self._require_status(self._read_status())
 
     def _recover_guard(self,cancel,abandoned,deadline):
@@ -438,7 +483,7 @@ class UR5eEmbodiment:
         except RobotRecoveryRequired:
             raise
         except Exception as error:
-            raise self._fault_error("Robot state feedback failed",{"driver_error":str(error)}) from error
+            raise self._driver_failure("Robot state feedback failed",{},category="state_feedback_error",error=error) from error
 
     def _images(self):
         images,metadata={},{}
@@ -467,31 +512,52 @@ class UR5eEmbodiment:
 
     def _servo(self,joints):
         cfg=self.config
-        before=self._assert_robot_ready("servo command")
+        details={"target_joints":list(joints),"arm_command_attempted":False,"arm_command_sent":False,
+                 "arm_command_acknowledged":False}
         try:
+            before=self._assert_robot_ready("servo command")
+            details["status_before"]=before
             token=self.control.initPeriod()
+            details.update(arm_command_attempted=True,arm_command_sent=None)
             if not self.control.servoJ(list(joints),cfg.velocity,cfg.acceleration,cfg.servo_time_s,cfg.servo_lookahead_s,cfg.servo_gain):
-                self._fault_error("UR5e servoJ rejected command",{"status_before":before})
-                try:
-                    after=self._read_status()
-                except RobotRecoveryRequired as error:
-                    after=error.status
-                raise self._fault_error("UR5e servoJ rejected command",{"status_before":before,"status_after":after})
+                raise self._driver_failure("UR5e servoJ rejected command",details,category="servo_rejected")
+            details.update(arm_command_sent=True,arm_command_acknowledged=True)
             self.control.waitPeriod(token)
             self._assert_robot_ready("servo feedback")
-        except RobotRecoveryRequired:
-            raise
+        except RobotRecoveryRequired as error:
+            raise self._failure_context(error,details)
         except Exception as error:
-            raise self._fault_error("UR5e servo command failed",{"driver_error":str(error)}) from error
+            raise self._driver_failure("UR5e servo command failed",details,category="servo_command_failed",error=error) from error
 
     def home(self,cancel):
+        return self._home(cancel,prepare_gripper=True)
+
+    def home_idle(self,cancel):
+        """Explicit idle Home moves the arm and preserves anything in the gripper."""
+        self.armed.clear()
+        return self._home(cancel,prepare_gripper=False)
+
+    def _home(self,cancel,*,prepare_gripper):
         cfg=self.config
         if cancel.is_set():
             raise InterruptedError("Home cancelled")
         self._assert_robot_ready("home")
-        # rACT=1 can move the fingers. Activation belongs to operator Start.
-        self.gripper.activate(cancel,self.command_lock)
-        initial=np.asarray(self.receive.getActualQ())
+        if prepare_gripper:
+            # Idle Home must never open a held object or activate the fingers.
+            try:
+                self.gripper.activate(cancel,self.command_lock)
+            except InterruptedError:
+                raise
+            except Exception as error:
+                raise self._driver_failure("Gripper preparation failed before home",{},
+                                           category="gripper_command_failed",error=error) from error
+        try:
+            initial=np.asarray(self.receive.getActualQ(),dtype=np.float64)
+            if initial.shape!=(6,) or not np.isfinite(initial).all():
+                raise ValueError("Home requires six finite measured joint positions")
+        except Exception as error:
+            raise self._driver_failure("Joint feedback failed before home",{},
+                                       category="state_feedback_error",error=error) from error
         steps=max(1,round(cfg.home_duration_s*cfg.home_hz))
         for index in range(steps):
             started=time.monotonic()
@@ -500,11 +566,16 @@ class UR5eEmbodiment:
                     raise InterruptedError("Home cancelled")
                 joints=initial+(np.asarray(cfg.home_joints)-initial)*(index+1)/steps
                 self._servo(joints)
-                if self.last_gripper_position!=0:
-                    self.gripper.move(0,cfg.gripper_speed,cfg.gripper_force)
-                    self.last_gripper_position=0
-                    self.last_gripper_time=time.monotonic()
-                self.gripper_status="open"
+                if prepare_gripper:
+                    try:
+                        if self.last_gripper_position!=0:
+                            self.gripper.move(0,cfg.gripper_speed,cfg.gripper_force)
+                            self.last_gripper_position=0
+                            self.last_gripper_time=time.monotonic()
+                        self.gripper_status="open"
+                    except Exception as error:
+                        raise self._driver_failure("Gripper open command failed during home",{},
+                                                   category="gripper_command_failed",error=error) from error
             if cancel.wait(max(0,1/cfg.home_hz-(time.monotonic()-started))):
                 raise InterruptedError("Home cancelled")
         if cancel.wait(0.5):
@@ -520,9 +591,12 @@ class UR5eEmbodiment:
             self.armed.set()
 
     def apply(self,prediction):
-        raw=action_vector(prediction.action)
-        if self.recovery_required:
-            self._assert_robot_ready("policy command")
+        try:
+            raw=action_vector(prediction.action)
+        except (TypeError,ValueError,OverflowError) as error:
+            self.armed.clear()
+            raise RobotActionError(str(error),status={"received_action":prediction.action,
+                                   "arm_command_sent":False}) from error
         action=raw.copy()
         cfg=self.config
         if cfg.max_rel_position is not None:
@@ -530,45 +604,99 @@ class UR5eEmbodiment:
         if cfg.max_rel_rotation is not None:
             action[3:6]=np.clip(action[3:6],-cfg.max_rel_rotation,cfg.max_rel_rotation)
         action[6]=np.clip(action[6],0,1)
+        with np.errstate(over="ignore",invalid="ignore"):
+            translation=float(np.hypot.reduce(raw[:3]))
+            rotation=float(np.hypot.reduce(raw[3:6]))
+        details={"raw_action":raw.tolist(),"clipped_action":action.tolist(),
+                 "action_translation_norm_m":translation if np.isfinite(translation) else repr(translation),
+                 "action_rotation_norm_rad":rotation if np.isfinite(rotation) else repr(rotation),
+                 "arm_command_attempted":False,"arm_command_sent":False,"arm_command_acknowledged":False,
+                 "gripper_command_attempted":False,"gripper_command_sent":False,
+                 "gripper_command_acknowledged":False}
+        if self.recovery_required:
+            try:
+                self._assert_robot_ready("policy command")
+            except RobotRecoveryRequired as error:
+                raise self._failure_context(error,details)
         with self.command_lock:
             if not self.armed.is_set():
                 raise InterruptedError("Policy command cancelled")
-            self._assert_robot_ready("policy command")
-            target=self.commanded @ self._transform(action[:3],action[3:6])
-            tcp=np.r_[target[:3,3],self.Rotation.from_matrix(target[:3,:3]).as_rotvec()]
             try:
-                current=list(self.receive.getActualQ())
-                joints=self.control.getInverseKinematics(tcp.tolist(),current)
-            except Exception as error:
-                raise self._fault_error("Inverse kinematics request failed",{"driver_error":str(error),"target_tcp_rotvec":tcp.tolist()}) from error
-            if joints is None or len(joints)!=6 or not np.isfinite(joints).all():
-                raise self._fault_error("No inverse kinematics solution for predicted action",{"target_tcp_rotvec":tcp.tolist(),"raw_action":raw.tolist()})
-            # Stop latches without waiting for this lock, so recheck after IK.
-            if not self.armed.is_set():
-                raise InterruptedError("Policy command cancelled during IK")
-            self._servo(joints)
-            self.commanded=target
-            self.steps+=1
-            desired="open" if self.steps<=cfg.initial_open_steps else self.gripper_status
-            if self.steps>cfg.initial_open_steps:
-                if self.gripper_status=="open" and action[6]>=cfg.close_threshold:
-                    desired="close"
-                elif self.gripper_status=="close" and action[6]<=cfg.release_threshold:
-                    desired="open"
-            position=255 if desired=="close" else 0
-            now=time.monotonic()
-            sent=False
-            if position!=self.last_gripper_position and now-self.last_gripper_time>=cfg.gripper_period_s:
-                # A cancellation after arm command must not issue another gripper move.
-                if self.armed.is_set():
-                    self.gripper.move(position,cfg.gripper_speed,cfg.gripper_force)
-                    self.last_gripper_position=position
-                    self.last_gripper_time=now
-                    self.gripper_status=desired
-                    sent=True
-            return {"raw_action":raw.tolist(),"clipped_action":action.tolist(),"target_tcp_rotvec":tcp.tolist(),
-                    "target_joints":list(joints),"gripper_desired":desired,"gripper_command":self.last_gripper_position,
-                    "gripper_command_sent":sent,"gripper_state":self.gripper_status}
+                self._assert_robot_ready("policy command")
+                details["previous_commanded_transform"]=self.commanded.tolist()
+                try:
+                    with np.errstate(over="ignore",invalid="ignore"):
+                        target=self.commanded @ self._transform(action[:3],action[3:6])
+                    if not np.isfinite(target).all():
+                        raise ValueError("Predicted action produced a nonfinite target transform")
+                    tcp=np.r_[target[:3,3],self.Rotation.from_matrix(target[:3,:3]).as_rotvec()]
+                except (TypeError,ValueError,OverflowError) as error:
+                    self.armed.clear()
+                    raise RobotActionError(str(error),status=details,category="invalid_action_target") from error
+                details["target_tcp_rotvec"]=tcp.tolist()
+                try:
+                    current=np.asarray(self.receive.getActualQ(),dtype=np.float64)
+                    if current.shape!=(6,) or not np.isfinite(current).all():
+                        raise ValueError("IK requires six finite measured joint positions")
+                except Exception as error:
+                    raise self._driver_failure("Joint feedback failed before inverse kinematics",details,
+                                               category="state_feedback_error",error=error) from error
+                details["measured_joints"]=current.tolist()
+                try:
+                    joints=self.control.getInverseKinematics(tcp.tolist(),current.tolist())
+                except Exception as error:
+                    raise self._driver_failure("Inverse kinematics request failed",details,
+                                               category="ik_request_failed",error=error) from error
+                try:
+                    valid_joints=np.asarray(joints,dtype=np.float64)
+                    valid_ik=valid_joints.shape==(6,) and np.isfinite(valid_joints).all()
+                except (TypeError,ValueError,OverflowError):
+                    valid_ik=False
+                if not valid_ik:
+                    reason=("No inverse kinematics solution for predicted action "
+                            f"(translation={1000*translation:.3f} mm, rotation={rotation:.6f} rad)")
+                    raise self._driver_failure(reason,details,category="ik_no_solution")
+                details["target_joints"]=valid_joints.tolist()
+                # Stop latches without waiting for this lock, so recheck after IK.
+                if not self.armed.is_set():
+                    raise InterruptedError("Policy command cancelled during IK")
+                self._servo(joints)
+                details.update(arm_command_attempted=True,arm_command_sent=True,arm_command_acknowledged=True)
+                self.commanded=target
+                self.steps+=1
+                desired="open" if self.steps<=cfg.initial_open_steps else self.gripper_status
+                if self.steps>cfg.initial_open_steps:
+                    if self.gripper_status=="open" and action[6]>=cfg.close_threshold:
+                        desired="close"
+                    elif self.gripper_status=="close" and action[6]<=cfg.release_threshold:
+                        desired="open"
+                position=255 if desired=="close" else 0
+                now=time.monotonic()
+                sent=False
+                if position!=self.last_gripper_position and now-self.last_gripper_time>=cfg.gripper_period_s:
+                    # A cancellation after arm command must not issue another gripper move.
+                    if self.armed.is_set():
+                        # A lost SET reply cannot establish whether the gripper
+                        # received the request. Never record it as "not sent".
+                        details.update(gripper_command_attempted=True,gripper_command_sent=None,
+                                       gripper_command_acknowledged=False)
+                        try:
+                            self.gripper.move(position,cfg.gripper_speed,cfg.gripper_force)
+                        except Exception as error:
+                            raise self._driver_failure("Gripper move command failed",details,
+                                                       category="gripper_command_failed",error=error) from error
+                        details.update(gripper_command_sent=True,gripper_command_acknowledged=True)
+                        self.last_gripper_position=position
+                        self.last_gripper_time=now
+                        self.gripper_status=desired
+                        sent=True
+                return {"raw_action":raw.tolist(),"clipped_action":action.tolist(),"target_tcp_rotvec":tcp.tolist(),
+                        "target_joints":list(joints),"gripper_desired":desired,"gripper_command":self.last_gripper_position,
+                        "gripper_command_attempted":details["gripper_command_attempted"],
+                        "gripper_command_sent":sent,"gripper_command_acknowledged":details["gripper_command_acknowledged"],
+                        "gripper_state":self.gripper_status}
+            except RobotRecoveryRequired as error:
+                raise self._failure_context(error,details)
 
     def stop(self):
         self.armed.clear()
@@ -584,16 +712,17 @@ class UR5eEmbodiment:
                 try:
                     confirmed=self.control.servoStop() is not False
                 except Exception as exc:
-                    error=exc
+                    error=self._driver_failure("UR5e stop command failed",{},category="stop_command_failed",error=exc)
             if self.gripper is not None:
                 try:
                     self.gripper.halt()
                 except Exception as exc:
-                    error=error or exc
+                    error=error or self._driver_failure("Gripper halt command failed",{},
+                                                       category="gripper_command_failed",error=exc)
             if error:
                 raise error
             if not confirmed:
-                self._fault_error("UR5e stop was not acknowledged")
+                self._driver_failure("UR5e stop was not acknowledged",{},category="stop_unconfirmed")
             return confirmed
         finally:
             self.command_lock.release()

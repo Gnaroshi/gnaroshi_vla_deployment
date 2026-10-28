@@ -107,12 +107,20 @@ class RolloutRecorder:
         self.count += 1
 
     def close(self):
-        self._emit_pending(1)
-        self.pending_images=None
-        self.log.close()
-        self.timestamps.close()
-        for writer in self.writers.values():
-            writer.release()
+        error = None
+        try:
+            self._emit_pending(1)
+        except Exception as failure:
+            error = failure
+        finally:
+            self.pending_images = None
+            for resource in (self.log, self.timestamps, *self.writers.values()):
+                try:
+                    (resource.release if hasattr(resource, "release") else resource.close)()
+                except Exception as failure:
+                    error = error or failure
+        if error is not None:
+            raise error
 
 
 def summary(rows):

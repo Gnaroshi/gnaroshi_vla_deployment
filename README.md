@@ -81,6 +81,7 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 | Start `[N]` | task home → policy reset → fresh rollout |
 | Success `[S]`, Failure `[F]` | 명령 중단 → 수동 결과/영상 저장 → task home |
 | Stop `[X]`, Retry `[R]` | 현재 attempt 폐기 → 현 위치 유지 |
+| Home `[H]` | READY에서 팔만 task home으로 이동; rollout·policy reset 없음 |
 | Recover robot | 보호정지 해제 후 상태·정지 확인 → 정책 버퍼 초기화 → READY |
 | Save `[W]` | 결과와 notes 저장 |
 | Delete last `[D]` | 확인 후 마지막 저장 결과/영상 삭제 |
@@ -88,7 +89,22 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 
 `max_steps`에 도달하면 정지 후 operator outcome을 기다린다. 자동 성공/실패로 분류하지 않는다.
 target Hz와 max steps는 READY에서 수정할 수 있다. 지연된 추론 결과는 Stop 이후 실행되지 않는다.
-성공/실패 뒤 home의 완료·취소·오류도 기록한다. 통신/장치 오류는 수동 task 실패와 구분한다.
+성공/실패 뒤 home의 완료·취소·오류도 기록한다. 실행 중 보호정지·연결 끊김·IK 실패·정책 오류는
+**자동 Failure**로 저장하고 성공률에 반영한다. 수동 Failure와는 원인·`outcome_source`로 구분한다.
+대기 중 발생한 오류는 note와 event를 남기며 새 rollout을 만들지 않는다.
+
+Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5e는 팔의 자세만 이동하고 그리퍼를
+열거나 activation하지 않는다. Stop/Exit로 취소할 수 있다. 다른 embodiment는 optional
+`home_idle(cancel)`을 제공하면 같은 분리가 적용되며, 없으면 기존 `home(cancel)`을 사용한다.
+단축키는 입력창·설정 선택·notes 편집 중에는 실행되지 않는다.
+
+### 화면과 실패 원인
+
+화면은 [gnaroshi_mds UI/UX 지침](https://github.com/Gnaroshi/gnaroshi_mds/blob/a4c6150b2feac1f03bd8cb7b7fa5c29769016e71/guides/ui-ux.md)의
+작업용 dark palette와 native control을 사용한다. 상태와 다음 조작, 카메라, 실행 결과를 먼저
+보여주고 경로·원시 오류·checkpoint identity는 Details에서 확인한다. 색상과 함께 상태 문구를
+표시한다. 자동 실패 원인은 rollout 목록과 읽기 전용 자동 notes에 남고 사용자가 작성한 notes와
+별도로 저장한다. 사용자가 편집한 notes를 자동 메시지로 덮어쓰지 않는다.
 
 ### 같은 창에서 checkpoint 교체
 
@@ -167,11 +183,11 @@ activation 자체가 손가락 움직임을 만들 수 있다. 별도 Python ope
 
 ### 보호정지 뒤 GUI에서 복구
 
-adapter의 관측·home·episode 시작·명령 중 `RobotRecoveryRequired(reason, status=...)`가 발생하면
-아직 수동 분류하지 않은 rollout은 오류로 보존하고 성공률에서는 제외한다. 이미 Success/Failure를
+adapter의 관측·home·episode 시작·명령 중 `RobotRecoveryRequired(reason, status=..., category=...)`가 발생하면
+진행 중인 미분류 rollout은 자동 Failure로 보존하고 성공률에 반영한다. 이미 Success/Failure를
 저장한 뒤 복귀 home에서 발생한 오류는 수동 결과를 유지하고 `outcome_home='error'`로 기록한다.
 세션은 RECOVERY_REQUIRED로 전환하며
-GUI·정책·카메라를 유지한다. Start, 성공/실패 분류, 자동 home과 checkpoint 교체는 차단한다.
+GUI·정책·카메라를 유지한다. Start, 성공/실패 분류, Home과 checkpoint 교체는 차단한다.
 지원되는 adapter에서는 camera-only preview를 계속 표시한다.
 
 사용자가 티치펜던트에서 원인을 확인하고 보호정지를 해제한 뒤 Recover robot을 누른다.
@@ -191,13 +207,20 @@ Stop·Exit는 복구를 취소하며 늦은 응답으로 재무장하지 않는�
 ```text
 manifest.json                   config, source 상태, policy/robot/camera metadata
 events.jsonl                    operator 요청, 폐기/삭제, 오류
-results.json / notes.txt        수동 결과·성공률과 notes
+results.json / notes.txt        수동·자동 결과, 성공률, 사용자·자동 notes
 rollout_0001_.../
-  result.json                   outcome, home 상태, 실제 Hz, latency 통계
+  result.json                   outcome/source, 실패 원인, home 상태, 실제 Hz, latency 통계
   steps.jsonl                   state/action/command/그리퍼와 단계별 시간
+  failed_step.json               실패한 입력·시도 action·원인과 command 확인 여부
   <camera-role>.mp4            실제 capture 시간에 대응하는 영상
   frames.jsonl                  source 관측 step과 video frame 매핑
 ```
+
+`failure_category`, `failure_reason`, `failure_note`, `failure_status`, `failure_phase`에
+보호정지·로봇 연결 끊김·IK 해 없음·servo 거부 등의 실제 관측 원인을 남긴다. IK 실패에는
+가능한 경우 action 크기와 target pose도 보관하며, 큰 action이 원인이라고 추정해서 쓰지 않는다.
+실패 관측도 영상에 보관하되 확인되지 않은 명령을 실행된 step이나 latency 통계에 넣지 않는다.
+기존 결과·영상은 소급 변경하지 않으며 복구를 다시 눌러도 같은 실패를 중복 집계하지 않는다.
 
 actual command Hz는 `(commands-1)/(last_command_time-first_command_time)`로 계산한다.
 policy/client/RPC/server/GPU 지연은 제공된 실제 측정값만 구분해서 집계한다.

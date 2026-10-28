@@ -22,16 +22,23 @@ project's deployment instructions before changing a deployment.
 - Start homes then resets a fresh episode. Success/Failure stop commands, save
   the manual outcome and return home. Stop/Retry discard the attempt and remain
   stationary. Max steps means waiting for an operator outcome, never automatic success.
+- An active attempt interrupted by a robot, policy or device fault is saved as an
+  automatic failure with its cause and prior observations/actions/media. Keep
+  automatic failures distinct from manual outcomes and preserve accepted outcomes
+  when only the return home fails. Idle faults must not invent a rollout.
 - Stop/close cancels in-flight predictions before they can issue a command.
   Raise the hardware stop latch before acquiring a command lock and check it
   inside apply. Failed or unconfirmed stops block further motion. Cleanup must
   run even when stop itself raises. Use finite network/camera deadlines.
 - Importing, config inspection, CPU tests and mock GUI must not connect to a
   model server, robot, gripper or camera. Real hardware requires the project's
-  explicit live action. Arm/home/gripper activation starts after operator Start.
+  explicit live action. Start authorizes episode preparation. A separate idle Home
+  authorizes arm homing after readiness checks; use home_idle when available to
+  preserve the gripper. Both operations remain cancellable by Stop/Exit.
 - Preserve the established operator flow. Do not add repeated TCP-bound or
   emergency-stop confirmation prompts. Deletion of saved results/media requires
-  GUI confirmation. Communication errors are not manual task failures.
+  GUI confirmation. Communication errors during an active attempt are automatic
+  failures with a recorded cause, rather than operator-classified outcomes.
 - Let the caller choose output storage with `DEPLOYMENT_OUTPUT_ROOT` or explicit
   config. Default generated files stay under ignored `.runtime`. Never commit
   checkpoints, caches, videos, logs, credentials or research outputs.

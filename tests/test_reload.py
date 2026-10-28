@@ -274,7 +274,8 @@ class CheckpointReload(unittest.TestCase):
         self.wait(lambda: not self.app._reload_in_progress)
         self.assertIs(self.app.session, old)
         self.assertTrue(old.can_replace)
-        self.assertIn("Checkpoint is unavailable", self.app.status.get())
+        self.assertIn("could not be loaded", self.app.status.get())
+        self.assertIn("Checkpoint is unavailable", self.app._load_error_detail)
         self.assertEqual((old.folder / "notes.txt").read_text(), "Preserve these experiment notes")
         self.app.reload_vars["checkpoint"].set("checkpoint_b")
         self.assertTrue(self.app.load_checkpoint())
@@ -282,6 +283,9 @@ class CheckpointReload(unittest.TestCase):
                   and not self.app._reload_in_progress)
         self.assertEqual(calls, ["missing_checkpoint", "checkpoint_b"])
         self.assertEqual((old.folder / "notes.txt").read_text(), "Preserve these experiment notes")
+        self.app.refresh()
+        self.assertIsNone(self.app._load_error_detail)
+        self.assertNotIn("Checkpoint is unavailable", self.app.details.get("1.0", "end"))
 
     def test_factory_canonical_selection_is_preserved_and_shown(self):
         def factory(selection, previous):
@@ -443,7 +447,9 @@ class CheckpointReload(unittest.TestCase):
         self.assertTrue(self.app.load_checkpoint())
         self.wait(lambda: not self.app._reload_in_progress)
         self.assertTrue(self.app._checkpoint_expanded)
-        self.assertIn("Full diagnostic", self.app.load_error.get("1.0", "end"))
+        self.assertNotIn("Full diagnostic", self.app.load_error.get("1.0", "end"))
+        self.assertIn("Open Details", self.app.load_error.get("1.0", "end"))
+        self.assertIn("Full diagnostic", self.app._load_error_detail)
         events = [json.loads(line) for line in (old.folder/"events.jsonl").read_text().splitlines()]
         failure = next(row for row in events if row["event"] == "reload_error")
         self.assertEqual(failure["selection"]["resolved_config"], {"recipe": "retained"})

@@ -8,10 +8,22 @@ import threading
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 from PIL import Image, ImageTk
 from .reference import ReferenceCatalog
 from .records import summary, write_json
 from .session import DeploymentSession
+
+
+# Semantic working palette, following Gnaroshi MDS ui-ux guidance. Device and
+# policy-specific identity belongs to the owning project's configuration.
+THEME = {
+    "canvas": "#11151B", "panel": "#181E26", "inset": "#222B38",
+    "border": "#354253", "text": "#F4F7FA", "muted": "#B7C0CC",
+    "accent": "#A7D7C8", "danger": "#E7A0A6", "warning": "#E8CC93",
+    "disabled": "#768391", "selection": "#304C55", "ink": "#11151B",
+}
+SPACE = {"small": 4, "button_y": 6, "control": 8, "group": 12, "section": 16}
 
 
 class DeploymentGUI:
@@ -42,160 +54,224 @@ class DeploymentGUI:
         self.photos, self.reference_images = [], []
         self.notes_job = None
         self.closing = False
+        self._shortcut_down = set()
+        self._shortcut_release_jobs = {}
+        self._failure_notes_seen = None
+        self._event_detail = ""
+        self._load_error_detail = None
         root.title(f"{session.config.method} | {session.config.task} deployment")
         root.geometry("1440x960")
         root.minsize(1100, 780)
-        root.configure(bg="#f4f5f6")
-        root.option_add("*Font", "{DejaVu Sans} 11")
-        style = ttk.Style(root)
-        style.theme_use("clam")
-        style.configure("TFrame", background="#f4f5f6")
-        style.configure("TLabel", background="#f4f5f6", foreground="#24272b")
-        style.configure("TButton", padding=(12, 9))
-        style.configure("TButton",background="#ffffff",foreground="#24272b",bordercolor="#d5dade",lightcolor="#ffffff",darkcolor="#ffffff")
-        style.configure("TLabelframe",background="#ffffff",bordercolor="#dde2e6",relief="solid")
-        style.configure("TLabelframe.Label",background="#f4f5f6",foreground="#59665f",font=("DejaVu Sans",10))
-        style.configure("Accent.TButton", background="#23664e", foreground="white")
-        style.configure("Stop.TButton", background="#b33d46", foreground="white")
-        style.configure("Treeview", rowheight=27, font=("DejaVu Sans", 10),background="#ffffff",fieldbackground="#ffffff")
+        self._configure_theme()
         self.state = tk.StringVar(value="CONNECTING")
-        self.status = tk.StringVar(value="Opening selected policy and embodiment")
+        self.status = tk.StringVar(value="Preparing deployment")
         self.metrics = tk.StringVar(value="No rollout measurements")
-        self.counts = tk.StringVar(value="Saved: 0   Success: 0   Failure: 0   SR: —")
+        self.counts = tk.StringVar(value="No saved rollouts")
+        self.failure_note = tk.StringVar(value="Select a saved rollout to view its result.")
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
-        heading = ttk.Frame(root, padding=18)
+        heading = ttk.Frame(root, padding=(SPACE["section"], SPACE["control"]))
         heading.grid(row=0, sticky="ew")
         heading.columnconfigure(0, weight=1)
-        self.heading_label = ttk.Label(heading, text=f"{session.config.task.title()}  /  {session.config.method}", font=("DejaVu Sans", 18, "bold"))
+        self.heading_label = ttk.Label(heading, text=f"{session.config.task.title()}  /  {session.config.method}", style="Heading.TLabel")
         self.heading_label.grid(row=0, column=0, sticky="w")
-        ttk.Label(heading, textvariable=self.state, font=("DejaVu Sans", 12, "bold")).grid(row=0, column=1, padx=16)
+        self.state_label = ttk.Label(heading, textvariable=self.state, style="State.TLabel", padding=(12, 8))
+        self.state_label.grid(row=0, column=1, padx=SPACE["group"])
         if self.reload_fields:
             self.checkpoint_toggle = ttk.Button(heading, text="Task / checkpoint...", command=self.toggle_checkpoint_panel)
-            self.checkpoint_toggle.grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(heading, text="Exit", command=self.close).grid(row=0, column=3 if self.reload_fields else 2)
-        self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1200)
-        self.instruction_label.grid(row=1, column=0, columnspan=4 if self.reload_fields else 3, sticky="w", pady=(12, 0))
-        if self.reload_fields:
-            self._checkpoint_panel(heading)
-        body = ttk.Frame(root, padding=(18,0,18,12))
+            self.checkpoint_toggle.grid(row=0, column=2, padx=(0, SPACE["control"]))
+        self.exit_button = ttk.Button(heading, text="Exit", command=self.close)
+        self.exit_button.grid(row=0, column=3 if self.reload_fields else 2)
+        self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1000, style="Muted.TLabel")
+        self.instruction_label.grid(row=1, column=0, columnspan=4 if self.reload_fields else 3, sticky="w", pady=(SPACE["control"], 0))
+        body = ttk.Frame(root, padding=(SPACE["section"], 0, SPACE["section"], SPACE["control"]))
         body.grid(row=1, sticky="nsew")
         body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=0, minsize=380)
+        body.columnconfigure(1, weight=0, minsize=400)
         body.rowconfigure(0, weight=1)
         main = ttk.Frame(body)
-        main.grid(row=0, column=0, sticky="nsew", padx=(0,18))
+        main.grid(row=0, column=0, sticky="nsew", padx=(0, SPACE["section"]))
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(0, weight=2)
-        main.rowconfigure(1, weight=1)
-        self.camera_labels = self._image_pair(main, "Live policy observations", row=0)
+        main.rowconfigure(1, weight=2)
+        main.rowconfigure(2, weight=1)
+        if self.reload_fields:
+            self._checkpoint_panel(main)
+        self.camera_labels = self._image_pair(main, "Live observations", row=1)
         self._references(main)
         side = ttk.Frame(body)
         side.grid(row=0, column=1, sticky="nsew")
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(4, weight=1)
-        controls = ttk.LabelFrame(side, text="Rollout", padding=10)
+        side.rowconfigure(3, weight=1)
+        controls = ttk.LabelFrame(side, text="Run control", padding=SPACE["control"])
         controls.grid(row=0, sticky="ew")
-        controls.columnconfigure(0, weight=1)
-        controls.columnconfigure(1, weight=1)
-        self.start_button = ttk.Button(controls, text="Start [N] · home first", style="Accent.TButton", command=self.start, state="disabled")
-        self.start_button.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,6))
-        self.stop_button = ttk.Button(controls, text="Stop & discard [X]", style="Stop.TButton", command=lambda:self.signal("stop"), state="disabled")
-        self.stop_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0,6))
+        controls.columnconfigure(0, weight=1, uniform="control")
+        controls.columnconfigure(1, weight=1, uniform="control")
+        self.start_button = ttk.Button(controls, text="Start rollout [N]", style="Accent.TButton", command=self.start, state="disabled")
+        self.start_button.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, SPACE["control"]))
         self.success_button = ttk.Button(controls, text="Success [S]", command=lambda:self.signal("success"), state="disabled")
-        self.success_button.grid(row=2, column=0, sticky="ew", padx=(0,3))
+        self.success_button.grid(row=1, column=0, sticky="ew", padx=(0, SPACE["small"]))
         self.failure_button = ttk.Button(controls, text="Failure [F]", command=lambda:self.signal("failure"), state="disabled")
-        self.failure_button.grid(row=2, column=1, sticky="ew", padx=(3,0))
+        self.failure_button.grid(row=1, column=1, sticky="ew", padx=(SPACE["small"], 0))
+        self.stop_button = ttk.Button(controls, text="Stop / discard [X]", style="Stop.TButton", command=lambda:self.signal("stop"), state="disabled")
+        self.stop_button.grid(row=2, column=0, sticky="ew", padx=(0, SPACE["small"]), pady=(SPACE["control"], 0))
         self.retry_button = ttk.Button(controls, text="Stop for retry [R]", command=lambda:self.signal("retry"), state="disabled")
-        self.retry_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        self.retry_button.grid(row=2, column=1, sticky="ew", padx=(SPACE["small"], 0), pady=(SPACE["control"], 0))
+        self.home_button = ttk.Button(controls, text="Home [H]", command=self.home_robot, state="disabled")
+        self.home_button.grid(row=3, column=0, sticky="ew", padx=(0, SPACE["small"]), pady=(SPACE["control"], 0))
         self.recover_button = ttk.Button(controls, text="Recover robot", command=self.recover_robot, state="disabled")
-        self.recover_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6,0))
-        self.recover_button.grid_remove()
-        self.control_hint = ttk.Label(controls, text="Success / Failure: save then return home\nStop / Retry: discard and remain stationary", font=("DejaVu Sans", 9))
-        self.control_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8,0))
-        settings = ttk.LabelFrame(side, text="Runtime · change while ready", padding=10)
-        settings.grid(row=1, sticky="ew", pady=10)
+        self.recover_button.grid(row=3, column=1, sticky="ew", padx=(SPACE["small"], 0), pady=(SPACE["control"], 0))
+        self.control_hint = ttk.Label(controls, text="Start: home, then a fresh rollout.\n" + self._home_description(), style="Muted.TLabel", wraplength=370)
+        self.control_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(SPACE["control"], 0))
+        metrics = ttk.LabelFrame(side, text="Measurements", padding=SPACE["control"])
+        metrics.grid(row=1, sticky="ew", pady=SPACE["group"])
+        ttk.Label(metrics, textvariable=self.metrics, justify="left").pack(anchor="w")
+        ttk.Label(side, textvariable=self.counts, wraplength=390, style="Muted.TLabel").grid(row=2, sticky="ew", pady=(0, SPACE["control"]))
+        tabs = ttk.Notebook(side)
+        tabs.grid(row=3, sticky="nsew")
+        results, notes, settings, details = (ttk.Frame(tabs, padding=SPACE["control"]) for _ in range(4))
+        for frame, title in ((results, "Rollouts"), (notes, "Notes"), (settings, "Settings"), (details, "Details")):
+            tabs.add(frame, text=title)
+        results.columnconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1)
+        self.table = ttk.Treeview(results, columns=("run", "result", "steps", "hz", "reason"), show="headings", height=5, selectmode="browse")
+        for column, title, width in (("run", "Run", 40), ("result", "Outcome", 70), ("steps", "Steps", 48), ("hz", "Hz", 48), ("reason", "Reason", 160)):
+            self.table.heading(column, text=title)
+            self.table.column(column, width=width, minwidth=width if column != "reason" else 80, stretch=column == "reason", anchor="w" if column == "reason" else "center")
+        self.table.tag_configure("failure", foreground=THEME["danger"])
+        self.table.tag_configure("success", foreground=THEME["accent"])
+        self.table.grid(row=0, column=0, sticky="nsew")
+        self.table.bind("<<TreeviewSelect>>", self.show_result_note)
+        ttk.Label(results, textvariable=self.failure_note, wraplength=370, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
+        notes.columnconfigure(0, weight=1)
+        notes.rowconfigure(1, weight=1)
+        ttk.Label(notes, text="Experiment notes · saved automatically", style="Muted.TLabel").grid(row=0, sticky="w", pady=(0, SPACE["small"]))
+        self.notes = tk.Text(notes, wrap="word", width=24, height=4, **self._text_style())
+        self.notes.grid(row=1, sticky="nsew")
+        self.notes.bind("<KeyRelease>", self.schedule_notes)
+        ttk.Label(notes, text="Recorded failure notes", style="Muted.TLabel").grid(row=2, sticky="w", pady=(SPACE["control"], SPACE["small"]))
+        self.failure_notes = tk.Text(notes, wrap="word", width=24, height=4, **self._text_style())
+        self.failure_notes.grid(row=3, sticky="ew")
+        self.failure_notes.configure(state="disabled")
         self.hz = tk.StringVar(value=str(session.config.target_hz))
         self.steps = tk.StringVar(value=str(session.config.max_steps))
-        ttk.Label(settings, text="Target Hz").grid(row=0,column=0,sticky="w")
-        ttk.Label(settings, text="Max steps").grid(row=1,column=0,sticky="w",pady=6)
+        settings.columnconfigure(1, weight=1)
+        ttk.Label(settings, text="Change while ready", style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, SPACE["group"]))
+        ttk.Label(settings, text="Target Hz").grid(row=1, column=0, sticky="w")
+        ttk.Label(settings, text="Max steps").grid(row=2, column=0, sticky="w", pady=SPACE["control"])
         self.hz_entry = ttk.Entry(settings, textvariable=self.hz, width=12)
-        self.hz_entry.grid(row=0,column=1,padx=8)
+        self.hz_entry.grid(row=1, column=1, sticky="ew", padx=(SPACE["control"], 0))
         self.steps_entry = ttk.Entry(settings, textvariable=self.steps, width=12)
-        self.steps_entry.grid(row=1,column=1,padx=8)
-        self.apply_button = ttk.Button(settings, text="Apply", command=self.apply_settings, state="disabled")
-        self.apply_button.grid(row=0,column=2,rowspan=2)
-        metrics = ttk.LabelFrame(side, text="Measured rollout", padding=10)
-        metrics.grid(row=2,sticky="ew")
-        ttk.Label(metrics,textvariable=self.metrics,justify="left",font=("DejaVu Sans",11)).pack(anchor="w")
-        ttk.Label(side,textvariable=self.counts,wraplength=375).grid(row=3,sticky="ew",pady=10)
-        tabs = ttk.Notebook(side)
-        tabs.grid(row=4,sticky="nsew")
-        results, notes, details = (ttk.Frame(tabs,padding=6) for _ in range(3))
-        for frame,title in ((results,"Rollouts"),(notes,"Notes"),(details,"Details")):
-            tabs.add(frame,text=title)
-        results.columnconfigure(0,weight=1)
-        results.rowconfigure(0,weight=1)
-        self.table = ttk.Treeview(results,columns=("run","result","steps","hz"),show="headings",height=5)
-        for column,title,width in (("run","Run",42),("result","Outcome",85),("steps","Steps",62),("hz","Hz",62)):
-            self.table.heading(column,text=title)
-            self.table.column(column,width=width,anchor="center")
-        self.table.grid(sticky="nsew")
-        notes.columnconfigure(0,weight=1)
-        notes.rowconfigure(0,weight=1)
-        self.notes = tk.Text(notes,wrap="word",width=24,height=6,relief="flat",padx=8,pady=8)
-        self.notes.grid(sticky="nsew")
-        self.notes.bind("<KeyRelease>",self.schedule_notes)
-        self.details = tk.Text(details,wrap="word",width=24,height=6,relief="flat",font=("DejaVu Sans",9))
-        self.details.pack(fill="both",expand=True)
+        self.steps_entry.grid(row=2, column=1, sticky="ew", padx=(SPACE["control"], 0))
+        self.apply_button = ttk.Button(settings, text="Apply settings", command=self.apply_settings, state="disabled")
+        self.apply_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(SPACE["control"], 0))
+        self.details = tk.Text(details, wrap="word", width=24, height=6, **self._text_style())
+        self.details.pack(fill="both", expand=True)
+        # Paths/provenance stay in the explicit Details tab, rather than the
+        # primary operating surface. Keep this label for project integrations.
+        self.folder_label = ttk.Label(details, text=str(session.folder), style="Muted.TLabel", wraplength=365)
+        self.folder_label.pack(fill="x", pady=(SPACE["control"], 0))
         records = ttk.Frame(side)
-        records.grid(row=5,sticky="ew",pady=(10,0))
-        ttk.Button(records,text="Save [W]",command=self.save).pack(side="left")
-        self.delete_button = ttk.Button(records,text="Delete last [D]",command=self.delete,state="disabled")
-        self.delete_button.pack(side="left",padx=6)
-        ttk.Label(root,textvariable=self.status,wraplength=1350,padding=(18,6)).grid(row=2,sticky="ew")
-        self.folder_label = ttk.Label(root,text=str(session.folder),padding=(18,0,18,12),font=("DejaVu Sans",9))
-        self.folder_label.grid(row=3,sticky="ew")
-        root.bind("<KeyPress>",self.keypress)
-        root.protocol("WM_DELETE_WINDOW",self.close)
+        records.grid(row=4, sticky="ew", pady=(SPACE["control"], 0))
+        ttk.Button(records, text="Save notes [W]", command=self.save).pack(side="left")
+        self.delete_button = ttk.Button(records, text="Delete last [D]", command=self.delete, state="disabled")
+        self.delete_button.pack(side="right")
+        ttk.Label(root, textvariable=self.status, wraplength=1380, padding=(SPACE["section"], SPACE["control"]), style="Muted.TLabel").grid(row=2, sticky="ew")
+        root.bind("<KeyPress>", self.keypress)
+        root.bind("<KeyRelease>", self.keyrelease)
+        root.bind("<FocusOut>", self._clear_shortcuts)
+        root.bind("<Configure>", self._resize_copy)
+        root.protocol("WM_DELETE_WINDOW", self.close)
         self._rows_seen = None
         self._details_seen = None
         session.start()
-        root.after(80,self.refresh)
+        root.after(80, self.refresh)
+
+    def _configure_theme(self):
+        self.root.configure(bg=THEME["canvas"])
+        family = tkfont.nametofont("TkDefaultFont").actual("family")
+        self._font_family = family
+        self.root.option_add("*Font", (family, 11))
+        self.style = style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".", background=THEME["canvas"], foreground=THEME["text"], font=(family, 11))
+        style.configure("TFrame", background=THEME["canvas"])
+        style.configure("TLabel", background=THEME["canvas"], foreground=THEME["text"])
+        style.configure("Muted.TLabel", foreground=THEME["muted"])
+        style.configure("Heading.TLabel", font=(family, 18, "bold"))
+        style.configure("State.TLabel", background=THEME["inset"], font=(family, 10, "bold"))
+        for name, color in (("Ready", THEME["accent"]), ("Fault", THEME["danger"]), ("Pending", THEME["warning"])):
+            style.configure(f"{name}.State.TLabel", foreground=color)
+        style.configure("TButton", background=THEME["inset"], foreground=THEME["text"], padding=(SPACE["control"], SPACE["button_y"]), bordercolor=THEME["border"], lightcolor=THEME["inset"], darkcolor=THEME["inset"], borderwidth=1, focusthickness=2, focuscolor=THEME["accent"])
+        style.map("TButton", background=[("active", THEME["border"])], foreground=[("disabled", THEME["disabled"])])
+        for name, color in (("Accent", THEME["accent"]), ("Stop", THEME["danger"])):
+            style.configure(f"{name}.TButton", background=color, foreground=THEME["ink"], bordercolor=color)
+            style.map(f"{name}.TButton", background=[("disabled", THEME["inset"]), ("active", color)], foreground=[("disabled", THEME["disabled"])])
+        style.configure("TLabelframe", background=THEME["canvas"], bordercolor=THEME["border"], relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=THEME["canvas"], foreground=THEME["muted"])
+        style.configure("TEntry", fieldbackground=THEME["panel"], foreground=THEME["text"], bordercolor=THEME["border"], insertcolor=THEME["text"], padding=SPACE["small"])
+        style.map("TEntry", fieldbackground=[("disabled", THEME["inset"])], foreground=[("disabled", THEME["disabled"])])
+        style.configure("TCombobox", fieldbackground=THEME["panel"], background=THEME["inset"], foreground=THEME["text"], arrowcolor=THEME["text"], bordercolor=THEME["border"], padding=SPACE["small"])
+        style.map("TCombobox", fieldbackground=[("readonly", THEME["panel"])], foreground=[("disabled", THEME["disabled"]), ("readonly", THEME["text"])], selectbackground=[("readonly", THEME["selection"])], selectforeground=[("readonly", THEME["text"])])
+        self.root.option_add("*TCombobox*Listbox.background", THEME["panel"])
+        self.root.option_add("*TCombobox*Listbox.foreground", THEME["text"])
+        self.root.option_add("*TCombobox*Listbox.selectBackground", THEME["selection"])
+        style.configure("Treeview", rowheight=28, font=(family, 10), background=THEME["panel"], fieldbackground=THEME["panel"], foreground=THEME["text"], borderwidth=0)
+        style.map("Treeview", background=[("selected", THEME["selection"])], foreground=[("selected", THEME["text"])])
+        style.configure("Treeview.Heading", background=THEME["inset"], foreground=THEME["muted"], padding=(SPACE["small"], SPACE["control"]), borderwidth=0)
+        style.configure("TNotebook", background=THEME["canvas"], borderwidth=0, tabmargins=0)
+        style.configure("TNotebook.Tab", background=THEME["panel"], foreground=THEME["muted"], padding=(SPACE["control"], SPACE["control"]))
+        style.map("TNotebook.Tab", background=[("selected", THEME["inset"])], foreground=[("selected", THEME["text"])])
+
+    def _text_style(self):
+        return {"background": THEME["panel"], "foreground": THEME["text"], "insertbackground": THEME["text"],
+                "selectbackground": THEME["selection"], "selectforeground": THEME["text"], "relief": "flat",
+                "highlightthickness": 1, "highlightbackground": THEME["border"], "highlightcolor": THEME["accent"], "padx": SPACE["control"], "pady": SPACE["control"]}
+
+    def _resize_copy(self, event):
+        if event.widget is self.root:
+            self.instruction_label.configure(wraplength=max(500, event.width - 48))
 
     def _checkpoint_panel(self, parent):
-        self.checkpoint_panel = panel = ttk.LabelFrame(parent, text="Policy selection · load while stopped", padding=8)
-        panel.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(12, 0))
-        panel.columnconfigure(1, weight=1)
+        self.checkpoint_panel = panel = ttk.LabelFrame(parent, text="Choose a policy · nothing loads until requested", padding=SPACE["control"])
+        panel.grid(row=0, column=0, sticky="ew", pady=(0, SPACE["group"]))
         selected = self.session.config.metadata.get("reload_selection", {})
-        for row, field in enumerate(self.reload_fields):
+        for index, field in enumerate(self.reload_fields):
+            row, column = divmod(index, 3)
+            panel.columnconfigure(column, weight=1, uniform="selection")
+            cell = ttk.Frame(panel)
+            cell.grid(row=row, column=column, sticky="ew", padx=(0, SPACE["control"]) if column != 2 else 0, pady=(0, SPACE["control"]))
+            cell.columnconfigure(0, weight=1)
             key, kind = field["key"], field.get("kind", "text")
             value = selected.get(key, field.get("value", ""))
             self.reload_vars[key] = variable = tk.StringVar(value=str(value))
-            ttk.Label(panel, text=field.get("label", key)).grid(row=row, column=0, sticky="w", padx=(0, 8))
+            ttk.Label(cell, text=field.get("label", key), style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, SPACE["small"]))
             if kind == "choice":
-                widget = ttk.Combobox(panel, textvariable=variable, values=field.get("choices", ()), state="readonly")
+                widget = ttk.Combobox(cell, textvariable=variable, values=field.get("choices", ()), state="readonly", width=1)
                 widget.bind("<<ComboboxSelected>>", lambda _event, key=key:self.resolve_selection(key))
             else:
-                widget = ttk.Entry(panel, textvariable=variable)
-            widget.grid(row=row, column=1, sticky="ew", pady=2)
+                widget = ttk.Entry(cell, textvariable=variable, width=1)
+            widget.grid(row=1, column=0, sticky="ew")
             self.reload_widgets.append((widget, "readonly" if kind == "choice" else "normal"))
             if kind in {"directory", "file"}:
-                button = ttk.Button(panel, text="Browse", command=lambda field=field:self.browse_checkpoint(field))
-                button.grid(row=row, column=2, padx=(6, 0))
+                button = ttk.Button(cell, text="Browse", command=lambda field=field:self.browse_checkpoint(field))
+                button.grid(row=1, column=1, padx=(SPACE["small"], 0))
                 self.reload_widgets.append((button, "normal"))
-        self.load_button = ttk.Button(panel, text="Load checkpoint", command=self.load_checkpoint, state="disabled")
-        self.load_button.grid(row=0, column=3, rowspan=max(1, len(self.reload_fields)), padx=(10, 0), sticky="ns")
+        actions_row = (len(self.reload_fields) + 2) // 3
         files = ttk.Frame(panel)
-        files.grid(row=len(self.reload_fields), column=0, columnspan=4, sticky="w", pady=(6, 0))
-        for title, callback, enabled in (("Load config JSON", self.load_config, self.config_loader),
-                                         ("Save config JSON", self.save_config, self.config_saver)):
+        files.grid(row=actions_row, column=0, columnspan=3, sticky="ew")
+        files.columnconfigure(0, weight=1)
+        config_buttons = ttk.Frame(files)
+        config_buttons.grid(row=0, column=0, sticky="w")
+        for title, callback, enabled in (("Load config", self.load_config, self.config_loader),
+                                         ("Save config", self.save_config, self.config_saver)):
             if enabled:
-                button = ttk.Button(files, text=title, command=callback)
-                button.pack(side="left", padx=(0, 6))
+                button = ttk.Button(config_buttons, text=title, command=callback)
+                button.pack(side="left", padx=(0, SPACE["control"]))
                 self.reload_widgets.append((button, "normal"))
-        self.load_error = tk.Text(panel, height=4, wrap="word", relief="flat", font=("DejaVu Sans", 9))
-        self.load_error.grid(row=len(self.reload_fields)+1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.load_button = ttk.Button(files, text="Load checkpoint", style="Accent.TButton", command=self.load_checkpoint, state="disabled")
+        self.load_button.grid(row=0, column=1, sticky="e")
+        self.load_error = tk.Text(panel, height=4, wrap="word", **self._text_style())
+        self.load_error.grid(row=actions_row + 1, column=0, columnspan=3, sticky="ew", pady=(SPACE["control"], 0))
         self.load_error.configure(state="disabled")
         self.load_error.grid_remove()
         self._record_selection(self.session, self.current_selection())
@@ -238,11 +314,13 @@ class DeploymentGUI:
             return False
 
     def _show_load_error(self, message, detail=None):
-        self.status.set(message)
+        self._load_error_detail = detail or message
+        summary = "The selected policy could not be loaded. Selection and notes are preserved. Check the selection, then load again. Open Details for diagnostics."
+        self.status.set(summary)
         if self.reload_fields:
             self.load_error.configure(state="normal")
             self.load_error.delete("1.0", "end")
-            self.load_error.insert("1.0", detail or message)
+            self.load_error.insert("1.0", summary)
             self.load_error.configure(state="disabled")
             self.load_error.grid()
             self._set_checkpoint_expanded(True)
@@ -399,6 +477,10 @@ class DeploymentGUI:
         self.notes.configure(state="normal")
         self.notes.delete("1.0", "end")
         self._rows_seen, self._details_seen = None, None
+        self._failure_notes_seen = None
+        self._load_error_detail = None
+        self._event_detail = ""
+        self.failure_note.set("Select a saved rollout to view its result.")
         self.photos = []
         for label in self.camera_labels:
             label.configure(image="", text="Waiting for frame")
@@ -447,19 +529,22 @@ class DeploymentGUI:
         labels=[]
         for column,role in enumerate(roles):
             ttk.Label(panel,text=role.title()).grid(row=0,column=column,sticky="w",pady=(0,4))
-            label=tk.Label(panel,bg="#202b36",fg="#d0d6dc",text="Waiting for frame",width=1,height=1)
+            label=tk.Label(panel,bg=THEME["panel"],fg=THEME["muted"],text="Waiting for frame",width=1,height=1)
             label.grid(row=1,column=column,sticky="nsew",padx=(0,4) if column==0 else (4,0))
             labels.append(label)
         return labels
 
     def _references(self,parent):
         frame=ttk.Frame(parent)
-        frame.grid(row=1,sticky="nsew")
+        self._reference_parent = parent
+        self._reference_error = None
+        frame.grid(row=2,sticky="nsew")
         frame.columnconfigure(0,weight=1)
         frame.rowconfigure(1,weight=1)
         toolbar=ttk.Frame(frame)
         toolbar.grid(row=0,sticky="ew",pady=(0,5))
-        ttk.Label(toolbar,text="Training start reference").pack(side="left",padx=(0,12))
+        self.reference_title = ttk.Label(toolbar, text="Training start reference", style="Muted.TLabel")
+        self.reference_title.pack(side="left", padx=(0, 12))
         self.reference_var=tk.StringVar(value="No reference manifest configured")
         self.reference_buttons=[]
         self._load_reference_catalog()
@@ -467,22 +552,43 @@ class DeploymentGUI:
             button=ttk.Button(toolbar,text=label,width=7,command=operation,state="normal" if self.catalog else "disabled")
             button.pack(side="left",padx=2)
             self.reference_buttons.append(button)
-        ttk.Label(toolbar,textvariable=self.reference_var).pack(side="left",padx=8)
+        self.reference_counter = ttk.Label(toolbar, textvariable=self.reference_var, style="Muted.TLabel")
+        self.reference_counter.pack(side="left", padx=8)
         self.reference_labels=self._image_pair(frame,"Episode start · never policy input",1,roles=("primary","wrist"))
+        self.reference_panel = self.reference_labels[0].master
+        self._sync_reference_visibility()
         self.show_reference()
 
     def _load_reference_catalog(self):
         self.catalog = None
         self.reference_images = []
-        self.reference_var.set("No reference manifest configured")
+        self._reference_error = None
+        self.reference_var.set("")
         if self.session.config.reference_manifest:
             try:
                 self.catalog = ReferenceCatalog(self.session.config.reference_manifest, self.session.config.task,
                                                 self.session.config.instruction)
             except Exception as error:
-                self.reference_var.set(str(error))
+                self._reference_error = str(error)
+                self.reference_var.set("Unavailable · see Details")
         for button in self.reference_buttons:
             button.configure(state="normal" if self.catalog else "disabled")
+        if hasattr(self, "reference_panel"):
+            self._sync_reference_visibility()
+
+    def _sync_reference_visibility(self):
+        if self.catalog:
+            self.reference_panel.grid()
+            self._reference_parent.rowconfigure(2, weight=1)
+            self.reference_title.configure(text="Training start reference")
+            for button in self.reference_buttons:
+                button.pack(side="left", padx=2, before=self.reference_counter)
+        else:
+            self.reference_panel.grid_remove()
+            self._reference_parent.rowconfigure(2, weight=0)
+            self.reference_title.configure(text="No training reference selected" if not self._reference_error else "Training reference unavailable")
+            for button in self.reference_buttons:
+                button.pack_forget()
 
     def show_reference(self):
         if self.catalog:
@@ -558,13 +664,98 @@ class DeploymentGUI:
         if not self.closing and not self._reload_in_progress and self.session.state=="READY" and self.session.results and messagebox.askyesno("Delete last result?","Delete the last saved result and its videos?",parent=self.root):
             self.session.delete_previous()
 
-    def keypress(self,event):
-        key=event.keysym.lower()
-        if isinstance(event.widget,(tk.Entry,tk.Text,tk.Spinbox,ttk.Entry,ttk.Combobox)):
+    def _home_description(self):
+        if callable(getattr(self.session.embodiment, "home_idle", None)):
+            return "Home moves only the arm; gripper stays unchanged."
+        return "Home uses the connected robot's configured home behavior."
+
+    def home_robot(self):
+        if self.closing or self._reload_in_progress or not self.session.can_home:
+            return False
+        if self.session.home_robot():
+            self.status.set("Moving home. " + self._home_description() + " No rollout will start.")
+            return True
+        return False
+
+    def keypress(self, event):
+        key = event.keysym.lower()
+        widget = event.widget
+        widget_class = widget.winfo_class() if hasattr(widget, "winfo_class") else ""
+        if isinstance(widget, (tk.Entry, tk.Text, tk.Spinbox, ttk.Entry, ttk.Combobox, ttk.Spinbox)) or widget_class in {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox", "Listbox"}:
             return
-        actions={"n":self.start,"x":lambda:self.signal("stop"),"s":lambda:self.signal("success"),"f":lambda:self.signal("failure"),"r":lambda:self.signal("retry"),"w":self.save,"d":self.delete,"escape":self.close}
+        # Shift/Ctrl/Alt/Super shortcuts belong to text editing and the desktop.
+        # NumLock/CapsLock do not change this app's unmodified-key contract.
+        if getattr(event, "state", 0) & 0xED:
+            return
+        pending = self._shortcut_release_jobs.pop(key, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+        if key in self._shortcut_down:
+            return "break"
+        actions = {"n": self.start, "h": self.home_robot, "x": lambda:self.signal("stop"),
+                   "s": lambda:self.signal("success"), "f": lambda:self.signal("failure"),
+                   "r": lambda:self.signal("retry"), "w": self.save, "d": self.delete, "escape": self.close}
         if key in actions:
+            self._shortcut_down.add(key)
             actions[key]()
+            return "break"
+
+    def keyrelease(self, event):
+        key = event.keysym.lower()
+        pending = self._shortcut_release_jobs.pop(key, None)
+        if pending is not None:
+            self.root.after_cancel(pending)
+        # X11 key repeat can emit a synthetic release/press pair. Deferring the
+        # release lets the next press cancel it and keeps one physical hold inert.
+        self._shortcut_release_jobs[key] = self.root.after(15, lambda:self._release_shortcut(key))
+
+    def _release_shortcut(self, key):
+        self._shortcut_release_jobs.pop(key, None)
+        self._shortcut_down.discard(key)
+
+    def _clear_shortcuts(self, _event=None):
+        for pending in self._shortcut_release_jobs.values():
+            self.root.after_cancel(pending)
+        self._shortcut_release_jobs.clear()
+        self._shortcut_down.clear()
+
+    @staticmethod
+    def _result_reason(result):
+        category = result.get("failure_category") or result.get("category")
+        labels = {"protective_stop": "Protective stop", "emergency_stop": "Emergency stop",
+                  "robot_disconnected": "Connection lost", "robot_safety_stop": "Safety stop",
+                  "robot_not_ready": "Robot not ready", "control_program_stopped": "Control stopped",
+                  "ik_no_solution": "No joint solution", "ik_request_failed": "Joint solver failed",
+                  "invalid_action": "Invalid action", "invalid_action_target": "Invalid target",
+                  "servo_rejected": "Command rejected", "servo_command_failed": "Command failed",
+                  "gripper_command_failed": "Gripper failed", "stop_unconfirmed": "Stop unconfirmed",
+                  "stop_command_failed": "Stop failed", "policy_error": "Policy failed",
+                  "state_feedback_error": "State feedback lost", "status_feedback_error": "Status unavailable",
+                  "recording_error": "Recording failed", "robot_fault": "Robot fault"}
+        if category:
+            return labels.get(category, "Unexpected failure")
+        return "Operator" if result.get("outcome") == "failure" else ""
+
+    @classmethod
+    def _result_note(cls, result):
+        if result.get("failure_reason") or result.get("failure_note") or result.get("category"):
+            text = cls._result_reason(result) + "."
+            status = result.get("failure_status") or result.get("status") or {}
+            motion = status.get("action_translation_norm_m") if isinstance(status, dict) else None
+            if isinstance(motion, (int, float)):
+                text += f" Requested movement: {motion*1000:.2f} mm."
+            return text + "\nAvailable records saved · see Details."
+        return "Marked as failure by the operator." if result.get("outcome") == "failure" else "Marked as success by the operator."
+
+    def show_result_note(self, _event=None):
+        selected = self.table.selection()
+        if not selected:
+            return
+        values = self.table.item(selected[0], "values")
+        with self.session.lock:
+            result = next((row for row in self.session.results if str(row["id"]) == str(values[0])), None)
+        if result is not None:
+            self.failure_note.set(self._result_note(result))
 
     def _show_images(self,images,labels):
         for image,label in zip(images,labels):
@@ -579,7 +770,9 @@ class DeploymentGUI:
             while True:
                 event=self.session.events.get_nowait()
                 if event.get("detail"):
-                    self.status.set(event["detail"])
+                    self._event_detail = str(event["detail"])
+                    if self.session.state not in {"ERROR", "RECOVERY_REQUIRED", "RECOVERING", "LOADING_POLICY", "CONNECTING", "CONNECTING_PREVIEW"}:
+                        self.status.set(event["detail"])
         except queue.Empty:
             pass
         self._reload_updates()
@@ -591,23 +784,49 @@ class DeploymentGUI:
         if state == "ERROR" and self.session._startup_error and self._load_error_session is not self.session:
             self._load_error_session = self.session
             self._show_load_error(self.session.error, getattr(self.session, "error_detail", None))
-        self.state.set("LOADING" if self._reload_in_progress and not self.closing else state)
+        displayed_state = "LOADING" if self._reload_in_progress and not self.closing else state
+        state_labels = {"SELECTING": "Choose policy", "READY": "Ready", "LOADING": "Loading policy",
+                        "LOADING_POLICY": "Loading policy", "CONNECTING_PREVIEW": "Opening cameras",
+                        "CONNECTING": "Connecting", "RECOVERY_REQUIRED": "Recovery needed",
+                        "RECOVERING": "Checking robot", "WAITING_OUTCOME": "Choose outcome",
+                        "HOMING": "Going home", "STARTING": "Starting", "RUNNING": "Running",
+                        "STOPPING": "Stopping", "ERROR": "Stopped with error", "CLOSED": "Closed"}
+        self.state.set(state_labels.get(displayed_state, displayed_state.replace("_", " ").capitalize()))
+        self.state_label.configure(style=("Ready.State.TLabel" if displayed_state == "READY" else
+                                         "Fault.State.TLabel" if displayed_state in {"ERROR", "RECOVERY_REQUIRED"} else
+                                         "Pending.State.TLabel" if displayed_state not in {"SELECTING", "CLOSED"} else "State.TLabel"))
+        if state == "ERROR" and not self._reload_in_progress:
+            self.status.set("Deployment stopped. Recorded logs and results are preserved. Open Details to inspect the cause before loading again.")
+        elif state == "RECOVERY_REQUIRED":
+            self.status.set("Robot fault: rollout stopped and its record is preserved. Resolve the condition, then Recover robot.")
+        elif state == "RECOVERING":
+            self.status.set("Checking robot health and confirmed stop. No motion is requested.")
+        elif state == "LOADING_POLICY":
+            self.status.set("Loading the selected policy. Camera preview remains available.")
+        elif state == "CONNECTING_PREVIEW":
+            self.status.set("Opening camera preview. Policy and robot control remain disconnected.")
+        elif state == "SELECTING":
+            self.status.set("Choose a task and checkpoint, then Load checkpoint. No policy is loaded.")
         ready=state=="READY" and not self.closing and not self._reload_in_progress
         recovery=state in {"RECOVERY_REQUIRED", "RECOVERING"} or self.session._recovery_fault
         active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING", "RECOVERY_REQUIRED", "RECOVERING"}
         self.start_button.configure(state="normal" if ready else "disabled")
         for button in (self.stop_button,self.retry_button):
             button.configure(state="normal" if active else "disabled")
-        if recovery:
-            self.retry_button.grid_remove()
-            self.recover_button.grid()
-        else:
-            self.recover_button.grid_remove()
-            self.retry_button.grid()
         self.recover_button.configure(text="Checking robot..." if state == "RECOVERING" else "Recover robot",
-                                      state="normal" if self.session.can_recover and not self.closing else "disabled")
-        self.control_hint.configure(text="Release fault on teach pendant, then Recover robot\nRecovery stays stationary; Start is separate" if recovery else
-                                    "Success / Failure: save then return home\nStop / Retry: discard and remain stationary")
+                                      state="normal" if self.session.can_recover and not self.closing and not self._reload_in_progress else "disabled")
+        home_allowed = self.session.can_home and not self.closing and not self._reload_in_progress
+        self.home_button.configure(text="Going home..." if state == "HOMING" and not self.session._rollout_active else "Home [H]",
+                                   state="normal" if home_allowed else "disabled")
+        automatic_notes = self.session.automatic_notes
+        latest_failure = automatic_notes[-1] if automatic_notes else None
+        if recovery:
+            reason = self._result_reason(latest_failure) if latest_failure else "Robot fault"
+            self.control_hint.configure(text=f"{reason}. Resolve the robot condition.\nThen Recover robot before Home / Start.", foreground=THEME["danger"])
+        elif state == "HOMING":
+            self.control_hint.configure(text="Moving to task home. Stop cancels the move.\n" + self._home_description(), foreground=THEME["muted"])
+        else:
+            self.control_hint.configure(text="Start: home, then a fresh rollout.\n" + self._home_description(), foreground=THEME["muted"])
         for button in (self.success_button,self.failure_button):
             button.configure(state="normal" if state in {"RUNNING","WAITING_OUTCOME"} else "disabled")
         for widget in (self.apply_button,self.hz_entry,self.steps_entry):
@@ -624,30 +843,54 @@ class DeploymentGUI:
         latency=stats["latency"]["policy_ms"]
         hz=stats["achieved_command_hz"]
         self.metrics.set(f"Target {self.session.config.target_hz:g} Hz   ·   Actual {hz:.2f} Hz" if hz is not None else f"Target {self.session.config.target_hz:g} Hz   ·   Actual —")
-        self.metrics.set(self.metrics.get()+f"\nSteps {stats['steps']}   ·   Active {stats['active_duration_s']:.1f} s\nPolicy / step {latency['mean_ms']:.1f} ms (mean)" if latency else self.metrics.get()+"\nNo policy latency measurements")
-        rpc=stats["latency"]["rpc_ms"]
-        if rpc:
-            self.metrics.set(self.metrics.get()+f"\nRPC {rpc['mean_ms']:.1f} ms · {rpc['count']} requests")
-        calls=stats["full_calls"] if stats["full_calls"] is not None else "—"
-        self.metrics.set(self.metrics.get()+f"\nBackbone calls {calls}   ·   Buffered {stats['buffered_steps']}")
-        successes=sum(r["outcome"]=="success" for r in results)
-        rate=f"{100*successes/len(results):.1f}%" if results else "—"
-        self.counts.set(f"Saved {len(results)}  ·  Success {successes}  ·  Failure {len(results)-successes}  ·  SR {rate}")
-        rendered=[(r["id"],r["outcome"],r["steps"],f"{r['achieved_command_hz']:.1f}" if r["achieved_command_hz"] is not None else "—") for r in results]
-        if rendered!=self._rows_seen:
+        self.metrics.set(self.metrics.get() + f"\nSteps {stats['steps']}   ·   Active {stats['active_duration_s']:.1f} s")
+        if latency:
+            self.metrics.set(self.metrics.get() + f"\nPolicy / step {latency['mean_ms']:.1f} ms (mean)")
+        successes = sum(r["outcome"] == "success" for r in results)
+        failures = sum(r["outcome"] == "failure" for r in results)
+        rate = f"{100*successes/len(results):.1f}%" if results else "—"
+        self.counts.set(f"Success {successes}  ·  Failure {failures}  ·  SR {rate}" if results else "No saved rollouts")
+        rendered = [(r["id"], r["outcome"], r["steps"], f"{r['achieved_command_hz']:.1f}" if r["achieved_command_hz"] is not None else "—", self._result_reason(r)) for r in results]
+        if rendered != self._rows_seen:
+            previous_selection = self.table.selection()
+            previous_id = self.table.item(previous_selection[0], "values")[0] if previous_selection else None
             self.table.delete(*self.table.get_children())
+            selected_item = None
             for row in rendered:
-                self.table.insert("","end",values=row)
-            self._rows_seen=rendered
-        details=json.dumps({"policy":self.session.policy.metadata,"embodiment":self.session.embodiment.metadata,
-                            "selection":self.session.config.metadata.get("reload_selection", {}),
-                            "results":str(self.session.folder)},indent=2)
-        if details!=self._details_seen:
+                item = self.table.insert("", "end", values=row, tags=(row[1],))
+                if str(row[0]) == str(previous_id):
+                    selected_item = item
+            if selected_item:
+                self.table.selection_set(selected_item)
+                self.show_result_note()
+            elif rendered:
+                latest_item = self.table.get_children()[-1]
+                self.table.selection_set(latest_item)
+                self.show_result_note()
+            else:
+                self.failure_note.set("Select a saved rollout to view its result.")
+            self._rows_seen = rendered
+        failure_notes = "\n\n".join((f"Rollout {note['rollout_id']}: " if note.get("rollout_id") is not None else "Outside rollout: ") + self._result_note(note) for note in automatic_notes) or "No automatic failures recorded."
+        if failure_notes != self._failure_notes_seen:
+            self.failure_notes.configure(state="normal")
+            self.failure_notes.delete("1.0", "end")
+            self.failure_notes.insert("1.0", failure_notes)
+            self.failure_notes.configure(state="disabled")
+            self._failure_notes_seen = failure_notes
+        details = json.dumps({"policy": self.session.policy.metadata, "embodiment": self.session.embodiment.metadata,
+                              "selection": self.session.config.metadata.get("reload_selection", {}),
+                              "results": str(self.session.folder), "latest_status_detail": self._event_detail,
+                              "error": self.session.error, "load_error": self._load_error_detail,
+                              "failure_results": [r for r in results if r.get("failure_reason")],
+                              "automatic_notes": automatic_notes,
+                              "reference_error": self._reference_error,
+                              "measurements": stats}, indent=2)
+        if details != self._details_seen:
             self.details.configure(state="normal")
-            self.details.delete("1.0","end")
-            self.details.insert("1.0",details)
+            self.details.delete("1.0", "end")
+            self.details.insert("1.0", details)
             self.details.configure(state="disabled")
-            self._details_seen=details
+            self._details_seen = details
         self.photos=[]
         if latest:
             self._show_images([latest.images[r] for r in self.session.config.camera_roles],self.camera_labels)
@@ -665,6 +908,7 @@ class DeploymentGUI:
             return
         self.save()
         self.closing=True
+        self._clear_shortcuts()
         self._reload_cancel.set()
         self.status.set("Stopping policy commands, finalizing recordings and closing devices")
         self.session.close()

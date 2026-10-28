@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import numpy as np
 from gnaroshi_deployment.adapters.ur5e import UR5eConfig,UR5eEmbodiment
-from gnaroshi_deployment.contracts import Prediction,RobotRecoveryRequired
+from gnaroshi_deployment.contracts import Prediction,RobotActionError,RobotRecoveryRequired
 
 
 class Receive:
@@ -196,6 +196,174 @@ class UR5eRecovery(unittest.TestCase):
                 self.assertFalse(env.armed.is_set())
                 self.assertEqual(env.control.calls,[])
                 self.assertEqual(env.gripper.calls,[])
+
+    def test_fault_categories_distinguish_safety_connection_program_and_ik(self):
+        for category,change in (
+            ("protective_stop",lambda env:setattr(env.receive,"safety",3)),
+            ("emergency_stop",lambda env:setattr(env.receive,"safety",6)),
+            ("robot_safety_stop",lambda env:setattr(env.receive,"safety",9)),
+            ("robot_disconnected",lambda env:setattr(env.receive,"connected",False)),
+            ("robot_disconnected",lambda env:setattr(env.control,"connected",False)),
+            ("robot_not_ready",lambda env:setattr(env.receive,"robot_mode",5)),
+            ("control_program_stopped",lambda env:setattr(env.control,"program",False)),
+        ):
+            with self.subTest(category=category):
+                env=self.make()
+                change(env)
+                with self.assertRaises(RobotRecoveryRequired) as raised:
+                    env.observe()
+                self.assertEqual(raised.exception.category,category)
+                self.assertEqual(env.recovery_error.category,category)
+                json.dumps(raised.exception.asdict(),allow_nan=False)
+                self.assertEqual(env.control.calls,[])
+                self.assertEqual(env.gripper.calls,[])
+
+    def test_disconnection_is_recorded_before_querying_stale_feedback(self):
+        env=self.make()
+        env.receive.connected=False
+        env.receive.getSafetyMode=lambda:(_ for _ in ()).throw(AssertionError("Stale feedback was queried"))
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.observe()
+        self.assertEqual(raised.exception.category,"robot_disconnected")
+        self.assertFalse(raised.exception.status["receive_connected"])
+        self.assertEqual(env.control.calls,[])
+
+    def test_no_ik_records_action_size_and_target_without_claiming_a_cause(self):
+        env=self.make()
+        env.control.ik=None
+        action=np.array([-.039492,.004053,-.074909,.01,.02,-.003,.7])
+        previous=env.commanded.copy()
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.apply(Prediction(action))
+        error=raised.exception
+        self.assertEqual(error.category,"ik_no_solution")
+        self.assertIn("84.779 mm",str(error))
+        self.assertAlmostEqual(error.status["action_translation_norm_m"],np.linalg.norm(action[:3]))
+        self.assertAlmostEqual(error.status["action_rotation_norm_rad"],np.linalg.norm(action[3:6]))
+        np.testing.assert_allclose(error.status["raw_action"],action)
+        np.testing.assert_allclose(error.status["previous_commanded_transform"],previous)
+        self.assertIn("target_tcp_rotvec",error.status)
+        self.assertIn("measured_joints",error.status)
+        self.assertFalse(error.status["arm_command_attempted"])
+        np.testing.assert_array_equal(env.commanded,previous)
+        self.assertEqual(env.control.calls,["IK"])
+        self.assertEqual(env.gripper.calls,[])
+        self.assertNotIn("too large",str(error))
+        json.dumps(error.asdict(),allow_nan=False)
+        json.dumps(env.metadata,allow_nan=False)
+
+    def test_invalid_action_is_json_safe_fatal_and_never_sends_a_command(self):
+        for action in (np.array([np.nan]*7),np.zeros(6),["bad"]*7):
+            with self.subTest(action=repr(action)):
+                env=self.make()
+                with self.assertRaises(RobotActionError) as raised:
+                    env.apply(Prediction(action))
+                self.assertEqual(raised.exception.category,"invalid_action")
+                self.assertFalse(env.armed.is_set())
+                self.assertFalse(env.recovery_required)
+                self.assertEqual(env.control.calls,[])
+                self.assertEqual(env.gripper.calls,[])
+                json.dumps(raised.exception.asdict(),allow_nan=False)
+
+    def test_servo_rejection_reports_observed_protective_stop_and_action(self):
+        env=self.make()
+        def rejected(*args):
+            env.control.calls.append("servoJ")
+            env.receive.safety=3
+            return False
+        env.control.servoJ=rejected
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.apply(Prediction(np.array([.001,0,0,0,0,0,.2])))
+        self.assertEqual(raised.exception.category,"protective_stop")
+        self.assertEqual(raised.exception.status["operation_failure_category"],"servo_rejected")
+        self.assertEqual(raised.exception.status["safety_mode"],3)
+        self.assertEqual(raised.exception.status["raw_action"][0],.001)
+        self.assertTrue(raised.exception.status["arm_command_attempted"])
+        self.assertIsNone(raised.exception.status["arm_command_sent"])
+        self.assertFalse(raised.exception.status["arm_command_acknowledged"])
+        self.assertEqual(env.control.calls,["IK","servoJ"])
+        self.assertEqual(env.gripper.calls,[])
+        json.dumps(raised.exception.asdict(),allow_nan=False)
+
+    def test_disconnect_after_servo_ack_keeps_the_sent_command_evidence(self):
+        env=self.make()
+        def lost(token):
+            env.receive.connected=False
+            raise ConnectionError("Mock RTDE connection lost after acknowledgement")
+        env.control.waitPeriod=lost
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.apply(Prediction(np.array([.001,0,0,0,0,0,.2])))
+        error=raised.exception
+        self.assertEqual(error.category,"robot_disconnected")
+        self.assertTrue(error.status["arm_command_attempted"])
+        self.assertTrue(error.status["arm_command_sent"])
+        self.assertTrue(error.status["arm_command_acknowledged"])
+        self.assertEqual(env.recovery_error.category,error.category)
+        for field in ("arm_command_attempted","arm_command_sent","arm_command_acknowledged"):
+            self.assertEqual(env.recovery_error.status[field],error.status[field])
+        self.assertEqual(error.status["operation_failure_category"],"servo_command_failed")
+        self.assertIn("after acknowledgement",error.status["driver_error"])
+        self.assertEqual(env.control.calls,["IK","servoJ"])
+        self.assertEqual(env.gripper.calls,[])
+        self.assertFalse(env.armed.is_set())
+        json.dumps(error.asdict(),allow_nan=False)
+
+    def test_overflowing_action_target_is_recordable_and_never_reaches_ik(self):
+        env=self.make()
+        env.commanded[0,3]=1e308
+        with self.assertRaises(RobotActionError) as raised:
+            env.apply(Prediction(np.array([1e308,0,0,0,0,0,.2])))
+        self.assertEqual(raised.exception.category,"invalid_action_target")
+        self.assertFalse(env.armed.is_set())
+        self.assertFalse(env.recovery_required)
+        self.assertEqual(env.control.calls,[])
+        self.assertEqual(env.gripper.calls,[])
+        json.dumps(raised.exception.asdict(),allow_nan=False)
+
+    def test_lost_gripper_reply_keeps_sent_unknown_and_preserves_arm_ack(self):
+        env=self.make()
+        def send_then_lose_reply(*args):
+            env.gripper.calls.append("move_sent")
+            raise ConnectionError("Mock gripper SET reply lost after send")
+        env.gripper.move=send_then_lose_reply
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.apply(Prediction(np.array([.001,0,0,0,0,0,.2])))
+        error=raised.exception
+        self.assertEqual(error.category,"gripper_command_failed")
+        self.assertTrue(error.status["arm_command_sent"])
+        self.assertTrue(error.status["arm_command_acknowledged"])
+        self.assertTrue(error.status["gripper_command_attempted"])
+        self.assertIsNone(error.status["gripper_command_sent"])
+        self.assertFalse(error.status["gripper_command_acknowledged"])
+        for field in ("arm_command_attempted","arm_command_sent","arm_command_acknowledged",
+                      "gripper_command_attempted","gripper_command_sent","gripper_command_acknowledged"):
+            self.assertEqual(env.recovery_error.status[field],error.status[field])
+        self.assertEqual(env.control.calls,["IK","servoJ"])
+        self.assertEqual(env.gripper.calls,["move_sent"])
+        self.assertFalse(env.armed.is_set())
+        json.dumps(error.asdict(),allow_nan=False)
+        json.dumps(env.metadata,allow_nan=False)
+
+    def test_idle_home_preserves_gripper_while_start_home_still_prepares_it(self):
+        class Running:
+            def is_set(self):return False
+            def wait(self,timeout):return False
+        for idle in (True,False):
+            with self.subTest(idle=idle):
+                env=self.make()
+                env.config.home_duration_s=.001
+                env.config.home_hz=1000
+                env.last_gripper_position=255
+                env.gripper_status="close"
+                before=env.commanded.copy()
+                (env.home_idle if idle else env.home)(Running())
+                self.assertEqual(env.control.calls,["servoJ"])
+                self.assertEqual(env.gripper.calls,[] if idle else ["activate","move"])
+                self.assertEqual(env.last_gripper_position,255 if idle else 0)
+                self.assertEqual(env.gripper_status,"close" if idle else "open")
+                self.assertEqual(env.steps,99)
+                np.testing.assert_array_equal(env.commanded,before)
+                if idle:self.assertFalse(env.armed.is_set())
 
     def test_unsafe_modes_and_emergency_stop_are_not_unlocked_by_recover(self):
         for safety,robot_mode in ((3,7),(6,7),(7,7),(9,7),(1,5),(1,3)):

@@ -105,7 +105,7 @@ class Sessions(unittest.TestCase):
         self.wait(lambda:session.state=="READY")
         self.assertEqual(session.results[0]["outcome"],"failure")
 
-    def test_invalid_model_reply_stops_and_preserves_error_without_counting_failure(self):
+    def test_invalid_model_reply_stops_and_preserves_automatic_failure(self):
         class BadPolicy(MockPolicy):
             def infer(self,observation,instruction):
                 result=super().infer(observation,instruction)
@@ -115,10 +115,10 @@ class Sessions(unittest.TestCase):
         session.start_rollout()
         self.wait(lambda:session.state=="ERROR")
         self.assertEqual(session.embodiment.applied,[])
-        self.assertEqual(session.results,[])
+        self.assertEqual([row["outcome"] for row in session.results],["failure"])
         files=list(session.folder.glob("rollout_*/result.json"))
         self.assertEqual(len(files),1)
-        self.assertEqual(json.loads(files[0].read_text())["outcome"],"error")
+        self.assertEqual(json.loads(files[0].read_text())["outcome"],"failure")
 
     def test_policy_health_failure_prevents_home_and_rearming(self):
         class HealthPolicy(MockPolicy):
