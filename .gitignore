@@ -1,0 +1,15 @@
+.runtime/
+checkpoints/
+artifacts/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.env
+.env.*
+*.log
+*.mp4
+*.pt
+*.pth
+*.safetensors
