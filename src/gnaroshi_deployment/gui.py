@@ -64,7 +64,7 @@ class DeploymentGUI:
         self.heading_label.grid(row=0, column=0, sticky="w")
         ttk.Label(heading, textvariable=self.state, font=("DejaVu Sans", 12, "bold")).grid(row=0, column=1, padx=16)
         if self.reload_fields:
-            self.checkpoint_toggle = ttk.Button(heading, text="Change checkpoint…", command=self.toggle_checkpoint_panel)
+            self.checkpoint_toggle = ttk.Button(heading, text="Change checkpoint...", command=self.toggle_checkpoint_panel)
             self.checkpoint_toggle.grid(row=0, column=2, padx=(0, 8))
         ttk.Button(heading, text="Exit", command=self.close).grid(row=0, column=3 if self.reload_fields else 2)
         self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1200)
@@ -183,7 +183,7 @@ class DeploymentGUI:
             self.checkpoint_panel.grid()
         else:
             self.checkpoint_panel.grid_remove()
-        self.checkpoint_toggle.configure(text="Hide checkpoint settings" if expanded else "Change checkpoint…")
+        self.checkpoint_toggle.configure(text="Hide checkpoint settings" if expanded else "Change checkpoint...")
 
     def toggle_checkpoint_panel(self):
         if not self.closing:

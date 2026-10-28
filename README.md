@@ -106,7 +106,7 @@ DeploymentGUI(root, session,
 
 `kind`는 `directory`, `file`, `text`, `choice`를 지원한다. 초기 선택은
 `config.metadata['reload_selection']`이 우선하며 각 field의 `value`가 기본값이다.
-선택 패널은 기본으로 접혀 있으며 헤더의 `Change checkpoint…`로 펼친다. Load 요청을 수락하면
+선택 패널은 기본으로 접혀 있으며 헤더의 `Change checkpoint...`로 펼친다. Load 요청을 수락하면
 다시 접어 결과표·notes 공간을 확보한다. 로드 오류는 상태 표시줄에 남고 패널을 다시 열어 수정한다.
 factory는 선택한 checkpoint/method를 config와 policy metadata에 명시하고, 필요한 경우
 checkpoint별 `output_root`를 정한다. factory에서 세션을 `start()`하지 않는다.
