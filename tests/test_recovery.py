@@ -1,5 +1,6 @@
 """Explicit recovery keeps the policy alive and cannot reuse a cancelled action."""
 import json
+import gc
 import os
 from pathlib import Path
 import tempfile
@@ -499,6 +500,9 @@ class RecoveryGUI(unittest.TestCase):
                 for callback in root.tk.call("after", "info"):
                     root.after_cancel(callback)
                 root.destroy()
+                app = None
+                root = None
+                gc.collect()
 
 
 if __name__ == "__main__":

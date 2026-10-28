@@ -1,5 +1,7 @@
 """CPU mock coverage for checkpoint replacement and its cancellation boundaries."""
 import copy
+import gc
+import weakref
 from dataclasses import replace
 import json
 import os
@@ -74,6 +76,16 @@ class CheckpointReload(unittest.TestCase):
         self.app = None
 
     def tearDown(self):
+        self.dispose_gui()
+        self.temporary.cleanup()
+
+    def dispose_gui(self):
+        """Release Tcl owners on the main thread before another worker can GC.
+
+        This fixture passes bound testcase methods as GUI factories, creating
+        testcase -> app -> reload_factory -> testcase cycles. Destroying the Tk
+        window alone does not release the Python interpreter/variable owners.
+        """
         for event in self.releases:
             event.set()
         if self.app is not None:
@@ -87,15 +99,47 @@ class CheckpointReload(unittest.TestCase):
             session.close()
             session.worker.join(3)
             self.assertTrue(session.shutdown_complete)
-        try:
-            # Each case owns its Tcl interpreter; do not leak scheduled refresh
-            # callbacks into the next interpreter's event processing.
-            for callback in self.root.tk.call("after", "info"):
-                self.root.after_cancel(callback)
-            self.root.destroy()
-        except tk.TclError:
-            pass
-        self.temporary.cleanup()
+        if self.root is not None:
+            try:
+                for callback in self.root.tk.call("after", "info"):
+                    self.root.after_cancel(callback)
+                self.root.destroy()
+            except tk.TclError:
+                pass
+        # Tk objects and the Tcl interpreter must lose their final references on
+        # this thread, never in an unrelated later checkpoint-loader allocation.
+        self.app = None
+        self.root = None
+        self.sessions.clear()
+        self.releases.clear()
+        gc.collect()
+
+    def test_fixture_releases_tcl_owners_before_background_gc(self):
+        session = self.launch()
+        owner_thread = threading.get_ident()
+        finalizer_threads = []
+        app_ref, root_ref = weakref.ref(self.app), weakref.ref(self.root)
+        weakref.finalize(self.app, lambda: finalizer_threads.append(threading.get_ident()))
+        weakref.finalize(self.root, lambda: finalizer_threads.append(threading.get_ident()))
+        self.dispose_gui()
+        self.assertIsNone(app_ref())
+        self.assertIsNone(root_ref())
+        self.assertEqual(finalizer_threads, [owner_thread, owner_thread])
+        errors = []
+        def allocate_and_collect():
+            try:
+                for _ in range(20):
+                    cycle = []
+                    cycle.append(cycle)
+                    gc.collect()
+            except BaseException as error:
+                errors.append(error)
+        worker = threading.Thread(target=allocate_and_collect, name="gui-cleanup-regression")
+        worker.start()
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(session.shutdown_complete)
 
     def wait(self, predicate, timeout=4):
         deadline = time.monotonic() + timeout

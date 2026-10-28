@@ -1,5 +1,6 @@
 """Native UI states, keyboard isolation and failure notes; CPU mock only."""
 import json
+import gc
 import os
 from pathlib import Path
 import tempfile
@@ -34,6 +35,9 @@ class GUIOperations(unittest.TestCase):
             self.root.destroy()
         except tk.TclError:
             pass
+        self.app = None
+        self.root = None
+        gc.collect()
         self.temporary.cleanup()
 
     def wait(self, predicate, timeout=4):
