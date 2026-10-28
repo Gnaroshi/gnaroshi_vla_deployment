@@ -14,6 +14,44 @@ from gnaroshi_deployment.contracts import SessionConfig
 from gnaroshi_deployment.session import DeploymentSession
 
 
+class ControlConnectionCancellation(unittest.TestCase):
+    def test_close_rechecks_stop_after_control_is_assigned(self):
+        entered, release = threading.Event(), threading.Event()
+        class Control:
+            disconnected = False
+            def servoStop(self):
+                return False
+            def disconnect(self):
+                self.disconnected = True
+        control = Control()
+        class ConnectingArm(UR5eEmbodiment):
+            def connect(self):
+                entered.set()
+                if not release.wait(2):
+                    raise TimeoutError("Test control connection did not finish")
+                self.control = control
+        config = UR5eConfig(robot_ip="127.0.0.1", camera_serials={"primary":"MOCK_P", "wrist":"MOCK_W"},
+                           home_joints=(0.0,)*6)
+        with tempfile.TemporaryDirectory() as temporary:
+            session = DeploymentSession(SessionConfig(output_root=temporary, record_video=False),
+                                        MockPolicy(), ConnectingArm(config), Path(__file__).parents[1])
+            try:
+                session.start()
+                self.assertTrue(entered.wait(1))
+                session.close()
+                session._stop_thread.join(1)
+                self.assertTrue(session._stop_results[session._stop_generation])
+            finally:
+                release.set()
+                session.worker.join(3)
+            self.assertFalse(session.worker.is_alive())
+            self.assertTrue(control.disconnected)
+            self.assertEqual(session.state, "ERROR")
+            self.assertIn("stop was not confirmed", session.error)
+            self.assertFalse(session.replacement_closed)
+            self.assertFalse(session.can_replace)
+
+
 class PreviewEmbodiment(MockEmbodiment):
     def __init__(self):
         super().__init__()

@@ -309,7 +309,8 @@ class UR5eEmbodiment:
 
     def close(self):
         try:
-            self.stop()
+            if not self.stop():
+                raise RuntimeError("UR5e stop was not confirmed during close")
         finally:
             for pipeline in self.cameras.values():
                 try:
