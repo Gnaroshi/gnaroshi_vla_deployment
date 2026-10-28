@@ -111,6 +111,34 @@ class Sessions(unittest.TestCase):
         self.assertEqual(len(files),1)
         self.assertEqual(json.loads(files[0].read_text())["outcome"],"error")
 
+    def test_policy_health_failure_prevents_home_and_rearming(self):
+        class HealthPolicy(MockPolicy):
+            failed = False
+            def check_ready(self):
+                if self.failed:
+                    raise RuntimeError("Policy process is unavailable")
+        policy = HealthPolicy()
+        session = self.make(policy)
+        policy.failed = True
+        session.start_rollout()
+        self.wait(lambda:session.state == "ERROR")
+        session.worker.join(1)
+        self.assertEqual(session.embodiment.home_count, 0)
+        self.assertEqual(session.embodiment.applied, [])
+        self.assertFalse(session.can_replace)
+
+    def test_policy_health_is_checked_while_ready(self):
+        class HealthPolicy(MockPolicy):
+            failed = False
+            def check_ready(self):
+                if self.failed:
+                    raise RuntimeError("Policy process is unavailable")
+        policy = HealthPolicy()
+        session = self.make(policy)
+        policy.failed = True
+        self.wait(lambda:session.state == "ERROR")
+        self.assertEqual(session.embodiment.home_count, 0)
+
     def test_stop_before_worker_dispatch_does_not_move_home(self):
         session=self.make()
         with session.lock:
@@ -134,6 +162,59 @@ class Sessions(unittest.TestCase):
         self.assertFalse(session.worker.is_alive())
         self.assertEqual(session.embodiment.applied,[])
         self.assertEqual(session.state,"CLOSED")
+
+    def test_close_cancels_policy_startup_without_reporting_an_error(self):
+        entered = threading.Event()
+        class LoadingPolicy(MockPolicy):
+            def connect(self):
+                entered.set()
+                session.closing.wait(2)
+                raise InterruptedError("Policy startup cancelled")
+        class UnconnectedEmbodiment(MockEmbodiment):
+            connect_calls = 0
+            def connect(self):
+                self.connect_calls += 1
+        embodiment = UnconnectedEmbodiment()
+        config = SessionConfig(output_root=self.temporary.name, record_video=False)
+        session = DeploymentSession(config, LoadingPolicy(), embodiment, Path(__file__).parents[1])
+        self.sessions.append(session)
+        session.start()
+        self.assertTrue(entered.wait(1))
+        session.close()
+        session.worker.join(1)
+        self.assertEqual(session.state, "CLOSED")
+        self.assertIsNone(session.error)
+        self.assertEqual(embodiment.connect_calls, 0)
+        self.assertTrue(session.replacement_closed)
+
+    def test_close_during_cleanup_does_not_issue_another_stop(self):
+        entered, release = threading.Event(), threading.Event()
+        class HealthPolicy(MockPolicy):
+            failed = False
+            def check_ready(self):
+                if self.failed:
+                    raise RuntimeError("Policy process is unavailable")
+        class ClosingEmbodiment(MockEmbodiment):
+            stop_calls = 0
+            def stop(self):
+                self.stop_calls += 1
+                return super().stop()
+            def close(self):
+                entered.set()
+                release.wait(2)
+        policy, embodiment = HealthPolicy(), ClosingEmbodiment()
+        session = self.make(policy, embodiment)
+        policy.failed = True
+        try:
+            self.assertTrue(entered.wait(1))
+            self.assertEqual(embodiment.stop_calls, 1)
+            session.close()
+            self.assertEqual(embodiment.stop_calls, 1)
+        finally:
+            release.set()
+        session.worker.join(1)
+        self.assertTrue(session.shutdown_complete)
+        self.assertEqual(session.state, "ERROR")
 
     def test_predispatch_stop_blocks_new_start_until_stop_acknowledged(self):
         observed,observe_release=threading.Event(),threading.Event()

@@ -89,6 +89,40 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 target Hz와 max steps는 READY에서 수정할 수 있다. 지연된 추론 결과는 Stop 이후 실행되지 않는다.
 성공/실패 뒤 home의 완료·취소·오류도 기록한다. 통신/장치 오류는 수동 task 실패와 구분한다.
 
+### 같은 창에서 checkpoint 교체
+
+프로젝트 launcher는 선택 항목과 새 세션 factory를 GUI에 전달할 수 있다.
+
+```python
+DeploymentGUI(root, session,
+    reload_fields=[
+        {"key": "checkpoint", "label": "Checkpoint", "kind": "directory"},
+        {"key": "mode", "label": "Mode", "kind": "choice", "choices": ["default", "alternative"],
+         "value": "default"},
+    ],
+    reload_factory=make_session)
+# make_session(selection: dict, previous_config: SessionConfig) -> unstarted DeploymentSession
+```
+
+`kind`는 `directory`, `file`, `text`, `choice`를 지원한다. 초기 선택은
+`config.metadata['reload_selection']`이 우선하며 각 field의 `value`가 기본값이다.
+factory는 선택한 checkpoint/method를 config와 policy metadata에 명시하고, 필요한 경우
+checkpoint별 `output_root`를 정한다. factory에서 세션을 `start()`하지 않는다.
+factory가 정규화한 `reload_selection`은 그대로 보존하고 입력한 값은 `reload_request`에 기록한다.
+재로딩 후 선택 항목도 정규화한 경로와 설정으로 갱신한다.
+factory가 실패하면 자체 생성한 서버·프로세스도 정리한 뒤 예외를 반환해야 한다.
+
+Load checkpoint는 READY, 정상 종료된 세션 또는 정책 로드 단계에서 안전하게 종료된 ERROR에서
+활성화된다. 실행·home·stop 중에는 교체할 수 없다. GUI는 notes를 저장하고 기존 세션의
+worker 종료·장치 정지 확인·cleanup을 기다린 뒤 background thread에서 factory를 호출한다.
+새 세션은 같은 task와 camera roles를 유지하며 별도 결과 폴더를 사용한다. 창과 선택 항목은
+유지하고 결과표·notes·측정·폴더 표시는 새 세션으로 바꾼다. 이전 결과·영상은 보존한다.
+
+잘못된 경로나 정책 로드 실패는 선택을 수정해 재시도할 수 있다. 추론·장치 오류, 정지 미확인,
+cleanup 실패는 교체를 차단한다. 로딩 중 Exit는 factory가 반환한 세션을 연결하지 않고 정리한 뒤
+창을 닫는다. 상태 검사는 `session.can_replace`, 교체 직전 종료 확인은
+`session.replacement_closed`, 종료 대기는 `session.shutdown_complete`로 구분한다.
+
 UR5e 연결 단계는 gripper 상태를 읽으며 activation은 operator Start 이후에 수행한다.
 activation 자체가 손가락 움직임을 만들 수 있다. 별도 Python open–close calibration 루프는 없다.
 하드웨어 adapter의 실제 수행 능력은 CPU mock 검증과 별개다.

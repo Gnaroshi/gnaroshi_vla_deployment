@@ -17,6 +17,7 @@ class DeploymentSession:
     def __init__(self, config: SessionConfig, policy, embodiment, repo: Path):
         config.validate()
         self.config, self.policy, self.embodiment = config, policy, embodiment
+        self.repo = Path(repo).resolve()
         self.folder = Path(config.output_root).expanduser().resolve() / f"{config.task}_{config.method}_{time.strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:8]}"
         self.folder.mkdir(parents=True)
         self.events = queue.Queue()
@@ -35,9 +36,14 @@ class DeploymentSession:
         self._stop_generation = 0
         self._stop_failed = False
         self._stop_confirmed = True
+        self._started = False
+        self._cleanup_complete = False
+        self._cleanup_started = False
+        self._cleanup_failed = False
+        self._policy_load_error = False
         self._notes = ""
         self._sequence = 0
-        self.manifest = {"config": config.asdict(), "source": provenance(repo),
+        self.manifest = {"config": config.asdict(), "source": provenance(self.repo),
                          "timing": {"achieved_command_hz": "(commands-1)/(last-first command monotonic time)",
                                     "policy_ms": "client preprocessing/inference/postprocessing including RPC; buffered steps remain distinct",
                                     "video": "policy observations resampled at 30 fps using capture timestamps; duplicate/drop mapping in frames.jsonl"}}
@@ -45,7 +51,35 @@ class DeploymentSession:
         self.worker = threading.Thread(target=self._run, name="deployment-worker", daemon=True)
 
     def start(self):
-        self.worker.start()
+        with self.lock:
+            if self._started:
+                raise RuntimeError("This session has already started")
+            self._started = True
+            self.worker.start()
+
+    @property
+    def shutdown_complete(self):
+        with self.lock:
+            return (self._started and not self.worker.is_alive() and self._cleanup_complete
+                    and not any(thread.is_alive() for thread in self._stop_threads))
+
+    @property
+    def replacement_closed(self):
+        """No worker/device cleanup remains and every stop was acknowledged."""
+        with self.lock:
+            return (self.shutdown_complete and not self._cleanup_failed
+                    and self._stop_confirmed and not self._stop_failed)
+
+    @property
+    def can_replace(self):
+        """READY is request eligibility; replacement_closed is required before construction."""
+        with self.lock:
+            if self._stop_failed or self._cleanup_failed or not self._stop_confirmed:
+                return False
+            if self.state == "READY" and not self.closing.is_set():
+                return True
+            return self.replacement_closed and (self.state == "CLOSED" or
+                                                self.state == "ERROR" and self._policy_load_error)
 
     def _state(self, state, detail=""):
         with self.lock:
@@ -129,6 +163,7 @@ class DeploymentSession:
                     return True
             if time.monotonic()>=deadline:
                 self._stop_failed=True
+                self._stop_confirmed=False
                 return False
 
     def _ready_after_stop(self):
@@ -199,19 +234,30 @@ class DeploymentSession:
             self.latest = observation
         return observation, 1000*(time.perf_counter()-started)
 
+    def _check_policy_ready(self):
+        check = getattr(self.policy, "check_ready", None)
+        if callable(check):
+            check()
+
     def _run(self):
+        stage = "dependencies"
         try:
+            if self.closing.is_set():
+                return
             if self.config.record_video:
                 import cv2  # Fail dependency validation before any device connects.
             # Metadata validation belongs in policy.connect, before robot.connect.
+            stage = "policy"
             self.policy.connect()
             if self.closing.is_set():
                 return
+            stage = "embodiment"
             self.embodiment.connect()
             self.manifest.update(policy=self.policy.metadata, embodiment=self.embodiment.metadata)
             write_json(self.folder / "manifest.json", self.manifest)
             if not self.closing.is_set():
                 self._state("READY")
+            stage = "running"
             while not self.closing.is_set():
                 try:
                     command = self.commands.get_nowait()
@@ -220,36 +266,59 @@ class DeploymentSession:
                 if command == "start":
                     self._rollout()
                 elif self.state == "READY":
+                    self._check_policy_ready()
                     self._preview()
                     self.closing.wait(0.04)
                 else:
                     self.closing.wait(0.02)
         except Exception as error:
-            self.error = f"{type(error).__name__}: {error}"
-            self._journal("error", detail=self.error)
-            self._state("ERROR", self.error)
+            if self.closing.is_set() and isinstance(error, InterruptedError):
+                self._journal("cancelled_startup", stage=stage)
+            else:
+                self._policy_load_error = stage == "policy"
+                self.error = f"{type(error).__name__}: {error}"
+                self._journal("error", detail=self.error)
+                self._state("ERROR", self.error)
         finally:
+            with self.lock:
+                self._cleanup_started = True
             try:
                 try:
                     if self._stop_threads:
                         if not self._wait_for_stops():
                             self.error=self.error or "Final stop failed or timed out"
                     else:
-                        if not self.embodiment.stop():
+                        self._stop_confirmed = bool(self.embodiment.stop())
+                        if not self._stop_confirmed:
+                            self._stop_failed = True
                             self.error=self.error or "Final stop was not confirmed"
                 except Exception as error:
+                    self._stop_failed = True
+                    self._stop_confirmed = False
                     self.error=self.error or f"Final stop: {error}"
                     self.events.put({"kind":"warning","detail":f"Final stop: {error}"})
                 finally:
                     self.embodiment.close()
             except Exception as error:
+                self._cleanup_failed = True
                 self.error=self.error or f"Hardware close: {error}"
                 self.events.put({"kind": "warning", "detail": f"Hardware close: {error}"})
             try:
                 self.policy.close()
+            except Exception as error:
+                self._cleanup_failed = True
+                self.error = self.error or f"Policy close: {error}"
+                self.events.put({"kind": "warning", "detail": f"Policy close: {error}"})
             finally:
-                self.save()
                 self._state("CLOSED" if self.closing.is_set() and not self.error else "ERROR", self.error or "")
+                try:
+                    self.save()
+                except Exception as error:
+                    self._cleanup_failed = True
+                    self.error = self.error or f"Final save: {error}"
+                    self._state("ERROR", self.error)
+                finally:
+                    self._cleanup_complete = True
 
     def _rollout(self):
         recorder = None
@@ -265,6 +334,7 @@ class DeploymentSession:
             return
         try:
             self._state("HOMING")
+            self._check_policy_ready()
             self.embodiment.home(self.cancel)
             if self.cancel.is_set():
                 raise InterruptedError("home cancelled")
@@ -377,4 +447,19 @@ class DeploymentSession:
             self.save()
 
     def close(self):
-        self.signal("close")
+        with self.lock:
+            if self.closing.is_set():
+                return
+            if self._cleanup_started:
+                # Final cleanup already owns stopping/disconnection; do not race it.
+                self.closing.set()
+                self.cancel.set()
+                return
+            if self._started and not self.worker.is_alive() and self._cleanup_complete:
+                self.closing.set()
+                return
+            self.signal("close")
+            if not self._started:
+                # A factory may return after Exit. Clean it up without connecting.
+                self._started = True
+                self.worker.start()

@@ -1,17 +1,37 @@
 """Desktop GUI; the session worker owns model and robot operations."""
 from __future__ import annotations
+import copy
 import json
+from pathlib import Path
 import queue
+import threading
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
 from .reference import ReferenceCatalog
-from .records import summary
+from .records import summary, write_json
+from .session import DeploymentSession
 
 
 class DeploymentGUI:
-    def __init__(self, root, session):
+    def __init__(self, root, session, *, reload_fields=None, reload_factory=None):
         self.root, self.session = root, session
+        self.reload_fields = tuple(reload_fields or ())
+        self.reload_factory = reload_factory
+        if bool(self.reload_fields) != bool(reload_factory):
+            raise ValueError("Checkpoint selection requires both reload_fields and reload_factory")
+        keys = [field["key"] for field in self.reload_fields]
+        if len(keys) != len(set(keys)) or any(not key for key in keys):
+            raise ValueError("Reload field keys must be nonempty and distinct")
+        if any(field.get("kind", "text") not in {"directory", "file", "text", "choice"} for field in self.reload_fields):
+            raise ValueError("Unknown reload field kind")
+        self.reload_vars, self.reload_widgets = {}, []
+        self._reload_events = queue.Queue()
+        self._reload_cancel = threading.Event()
+        self._reload_thread = None
+        self._reload_in_progress = False
+        self._reload_blocked = False
+        self._reload_cleanup_session = None
         self.photos, self.reference_images = [], []
         self.notes_job = None
         self.closing = False
@@ -40,10 +60,14 @@ class DeploymentGUI:
         heading = ttk.Frame(root, padding=18)
         heading.grid(row=0, sticky="ew")
         heading.columnconfigure(0, weight=1)
-        ttk.Label(heading, text=f"{session.config.task.title()}  /  {session.config.method}", font=("DejaVu Sans", 18, "bold")).grid(row=0, column=0, sticky="w")
+        self.heading_label = ttk.Label(heading, text=f"{session.config.task.title()}  /  {session.config.method}", font=("DejaVu Sans", 18, "bold"))
+        self.heading_label.grid(row=0, column=0, sticky="w")
         ttk.Label(heading, textvariable=self.state, font=("DejaVu Sans", 12, "bold")).grid(row=0, column=1, padx=16)
         ttk.Button(heading, text="Exit", command=self.close).grid(row=0, column=2)
-        ttk.Label(heading, text=session.config.instruction, wraplength=1200).grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1200)
+        self.instruction_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        if self.reload_fields:
+            self._checkpoint_panel(heading)
         body = ttk.Frame(root, padding=(18,0,18,12))
         body.grid(row=1, sticky="nsew")
         body.columnconfigure(0, weight=1)
@@ -116,13 +140,168 @@ class DeploymentGUI:
         self.delete_button = ttk.Button(records,text="Delete last [D]",command=self.delete)
         self.delete_button.pack(side="left",padx=6)
         ttk.Label(root,textvariable=self.status,wraplength=1350,padding=(18,6)).grid(row=2,sticky="ew")
-        ttk.Label(root,text=str(session.folder),padding=(18,0,18,12),font=("DejaVu Sans",9)).grid(row=3,sticky="ew")
+        self.folder_label = ttk.Label(root,text=str(session.folder),padding=(18,0,18,12),font=("DejaVu Sans",9))
+        self.folder_label.grid(row=3,sticky="ew")
         root.bind("<KeyPress>",self.keypress)
         root.protocol("WM_DELETE_WINDOW",self.close)
         self._rows_seen = None
         self._details_seen = None
         session.start()
         root.after(80,self.refresh)
+
+    def _checkpoint_panel(self, parent):
+        panel = ttk.LabelFrame(parent, text="Policy selection · load while stopped", padding=8)
+        panel.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        panel.columnconfigure(1, weight=1)
+        selected = self.session.config.metadata.get("reload_selection", {})
+        for row, field in enumerate(self.reload_fields):
+            key, kind = field["key"], field.get("kind", "text")
+            value = selected.get(key, field.get("value", ""))
+            self.reload_vars[key] = variable = tk.StringVar(value=str(value))
+            ttk.Label(panel, text=field.get("label", key)).grid(row=row, column=0, sticky="w", padx=(0, 8))
+            if kind == "choice":
+                widget = ttk.Combobox(panel, textvariable=variable, values=field.get("choices", ()), state="readonly")
+            else:
+                widget = ttk.Entry(panel, textvariable=variable)
+            widget.grid(row=row, column=1, sticky="ew", pady=2)
+            self.reload_widgets.append((widget, "readonly" if kind == "choice" else "normal"))
+            if kind in {"directory", "file"}:
+                button = ttk.Button(panel, text="Browse", command=lambda field=field:self.browse_checkpoint(field))
+                button.grid(row=row, column=2, padx=(6, 0))
+                self.reload_widgets.append((button, "normal"))
+        self.load_button = ttk.Button(panel, text="Load checkpoint", command=self.load_checkpoint)
+        self.load_button.grid(row=0, column=3, rowspan=max(1, len(self.reload_fields)), padx=(10, 0), sticky="ns")
+        self._record_selection(self.session, {key:value.get() for key,value in self.reload_vars.items()})
+
+    @staticmethod
+    def _record_selection(session, selection):
+        # The project factory may resolve paths and select a canonical checkpoint.
+        session.config.metadata.setdefault("reload_selection", dict(selection))
+        session.config.metadata["reload_request"] = dict(selection)
+        session.manifest["config"] = session.config.asdict()
+        write_json(session.folder / "manifest.json", session.manifest)
+
+    def browse_checkpoint(self, field):
+        if self.closing or self._reload_in_progress or self._reload_blocked or not self.session.can_replace:
+            return
+        options = {"parent": self.root, "title": field.get("label", field["key"])}
+        current = self.reload_vars[field["key"]].get().strip()
+        if current:
+            options["initialdir"] = current if field["kind"] == "directory" else str(Path(current).parent)
+        chosen = (filedialog.askdirectory if field["kind"] == "directory" else filedialog.askopenfilename)(**options)
+        if chosen:
+            self.reload_vars[field["key"]].set(chosen)
+
+    def load_checkpoint(self):
+        if not self.reload_factory or self.closing or self._reload_in_progress or self._reload_blocked or not self.session.can_replace:
+            return False
+        self.save()
+        selection = {key:value.get() for key,value in self.reload_vars.items()}
+        previous, previous_config = self.session, copy.deepcopy(self.session.config)
+        self._reload_in_progress = True
+        self.status.set("Closing the current session before loading the selected checkpoint")
+        self._reload_thread = threading.Thread(target=self._reload, args=(previous, selection, previous_config),
+                                               name="checkpoint-loader", daemon=True)
+        self._reload_thread.start()
+        return True
+
+    def _reload(self, previous, selection, previous_config):
+        candidate = None
+        handed_off = False
+        try:
+            previous.close()
+            previous.worker.join()
+            if not previous.can_replace or not previous.replacement_closed:
+                raise RuntimeError("Session did not close with confirmed stop and cleanup; checkpoint replacement is blocked")
+            if self._reload_cancel.is_set():
+                return
+            self._reload_events.put(("status", "Loading the selected checkpoint"))
+            candidate = self.reload_factory(dict(selection), previous_config)
+            if not isinstance(candidate, DeploymentSession) or candidate is previous:
+                raise TypeError("reload_factory must return a new unstarted DeploymentSession")
+            if candidate.worker.ident is not None:
+                raise RuntimeError("reload_factory returned an already-started session")
+            if candidate.config.task != previous.config.task:
+                raise ValueError("Checkpoint changes must keep the selected task")
+            if candidate.config.camera_roles != previous.config.camera_roles:
+                raise ValueError("Checkpoint changes must keep the configured camera roles")
+            if candidate.folder == previous.folder:
+                raise ValueError("A replacement must use its own result directory")
+            self._record_selection(candidate, selection)
+            if self._reload_cancel.is_set():
+                return
+            decision, acknowledged = {"accepted": False}, threading.Event()
+            self._reload_events.put(("ready", candidate, decision, acknowledged))
+            while not acknowledged.wait(.05):
+                if self._reload_cancel.is_set():
+                    break
+            handed_off = decision["accepted"]
+        except Exception as error:
+            self._reload_events.put(("error", f"Checkpoint load failed: {type(error).__name__}: {error}"))
+        finally:
+            try:
+                if isinstance(candidate, DeploymentSession) and candidate is not previous and not handed_off:
+                    self._reload_cleanup_session = candidate
+                    candidate.close()
+                    candidate.worker.join()
+                    if not candidate.replacement_closed:
+                        self._reload_events.put(("blocked", "Replacement cleanup or stop was not confirmed; checkpoint replacement is blocked"))
+                    else:
+                        self._reload_cleanup_session = None
+            except Exception as error:
+                self._reload_events.put(("blocked", f"Replacement cleanup failed: {error}; checkpoint replacement is blocked"))
+            finally:
+                self._reload_events.put(("done",))
+
+    def _bind_session(self, session):
+        self.session = session
+        self.root.title(f"{session.config.method} | {session.config.task} deployment")
+        self.heading_label.configure(text=f"{session.config.task.title()}  /  {session.config.method}")
+        self.instruction_label.configure(text=session.config.instruction)
+        self.folder_label.configure(text=str(session.folder))
+        self.hz.set(str(session.config.target_hz))
+        self.steps.set(str(session.config.max_steps))
+        for key, value in session.config.metadata.get("reload_selection", {}).items():
+            if key in self.reload_vars:
+                self.reload_vars[key].set(str(value))
+        self.notes.configure(state="normal")
+        self.notes.delete("1.0", "end")
+        self._rows_seen, self._details_seen = None, None
+        self.photos = []
+        for label in self.camera_labels:
+            label.configure(image="", text="Waiting for frame")
+        self._load_reference_catalog()
+        for label in self.reference_labels:
+            label.configure(image="", text="Waiting for frame")
+        self.show_reference()
+        self.state.set("CONNECTING")
+        self.status.set("Opening selected policy and embodiment")
+        session.start()
+
+    def _reload_updates(self):
+        while True:
+            try:
+                event = self._reload_events.get_nowait()
+            except queue.Empty:
+                return
+            kind = event[0]
+            if kind == "ready":
+                _, candidate, decision, acknowledged = event
+                try:
+                    if not self.closing:
+                        self._bind_session(candidate)
+                        decision["accepted"] = True
+                except Exception as error:
+                    self.status.set(f"Checkpoint load failed: {error}")
+                finally:
+                    acknowledged.set()
+            elif kind == "done":
+                self._reload_in_progress = False
+            elif kind == "blocked":
+                self._reload_blocked = True
+                self.status.set(event[1])
+            elif not self.closing:
+                self.status.set(event[1])
 
     def _image_pair(self,parent,title,row,roles=None):
         panel = ttk.LabelFrame(parent,text=title,padding=8)
@@ -148,17 +327,28 @@ class DeploymentGUI:
         toolbar.grid(row=0,sticky="ew",pady=(0,5))
         ttk.Label(toolbar,text="Training start reference").pack(side="left",padx=(0,12))
         self.reference_var=tk.StringVar(value="No reference manifest configured")
-        self.catalog=None
-        if self.session.config.reference_manifest:
-            try:
-                self.catalog=ReferenceCatalog(self.session.config.reference_manifest,self.session.config.task,self.session.config.instruction)
-            except Exception as error:
-                self.reference_var.set(str(error))
+        self.reference_buttons=[]
+        self._load_reference_catalog()
         for label,operation in (("‹",lambda:self.move_reference(-1)),("›",lambda:self.move_reference(1)),("Random",self.random_reference),("Zoom",self.zoom_reference)):
-            ttk.Button(toolbar,text=label,width=7,command=operation,state="normal" if self.catalog else "disabled").pack(side="left",padx=2)
+            button=ttk.Button(toolbar,text=label,width=7,command=operation,state="normal" if self.catalog else "disabled")
+            button.pack(side="left",padx=2)
+            self.reference_buttons.append(button)
         ttk.Label(toolbar,textvariable=self.reference_var).pack(side="left",padx=8)
         self.reference_labels=self._image_pair(frame,"Episode start · never policy input",1,roles=("primary","wrist"))
         self.show_reference()
+
+    def _load_reference_catalog(self):
+        self.catalog = None
+        self.reference_images = []
+        self.reference_var.set("No reference manifest configured")
+        if self.session.config.reference_manifest:
+            try:
+                self.catalog = ReferenceCatalog(self.session.config.reference_manifest, self.session.config.task,
+                                                self.session.config.instruction)
+            except Exception as error:
+                self.reference_var.set(str(error))
+        for button in self.reference_buttons:
+            button.configure(state="normal" if self.catalog else "disabled")
 
     def show_reference(self):
         if self.catalog:
@@ -189,8 +379,12 @@ class DeploymentGUI:
             tk.Label(window,image=photo).grid(row=0,column=column)
 
     def start(self):
+        if self.closing or self._reload_in_progress:
+            return False
         if self.session.start_rollout():
             self.status.set("Moving to task home, then resetting policy and starting rollout")
+            return True
+        return False
 
     def signal(self,action):
         if self.session.signal(action):
@@ -198,6 +392,8 @@ class DeploymentGUI:
 
     def apply_settings(self):
         try:
+            if self.closing or self._reload_in_progress:
+                raise RuntimeError("Wait for checkpoint loading to finish")
             self.session.apply_settings(self.hz.get(),self.steps.get())
             self.status.set("Runtime settings applied")
         except Exception as error:
@@ -209,12 +405,14 @@ class DeploymentGUI:
         self.notes_job=self.root.after(500,self.save)
 
     def save(self):
+        if self.notes_job:
+            self.root.after_cancel(self.notes_job)
         self.notes_job=None
         self.session.save(self.notes.get("1.0","end-1c"))
         self.status.set("Results and notes saved")
 
     def delete(self):
-        if self.session.state=="READY" and self.session.results and messagebox.askyesno("Delete last result?","Delete the last saved result and its videos?",parent=self.root):
+        if not self.closing and not self._reload_in_progress and self.session.state=="READY" and self.session.results and messagebox.askyesno("Delete last result?","Delete the last saved result and its videos?",parent=self.root):
             self.session.delete_previous()
 
     def keypress(self,event):
@@ -241,13 +439,14 @@ class DeploymentGUI:
                     self.status.set(event["detail"])
         except queue.Empty:
             pass
+        self._reload_updates()
         with self.session.lock:
             state=self.session.state
             rows=list(self.session.rows)
             results=list(self.session.results)
             latest=self.session.latest
-        self.state.set(state)
-        ready=state=="READY"
+        self.state.set("LOADING" if self._reload_in_progress and not self.closing else state)
+        ready=state=="READY" and not self.closing and not self._reload_in_progress
         active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING"}
         self.start_button.configure(state="normal" if ready else "disabled")
         for button in (self.stop_button,self.retry_button):
@@ -257,6 +456,12 @@ class DeploymentGUI:
         for widget in (self.apply_button,self.hz_entry,self.steps_entry):
             widget.configure(state="normal" if ready else "disabled")
         self.delete_button.configure(state="normal" if ready and results else "disabled")
+        if self.reload_fields:
+            allowed = not self.closing and not self._reload_in_progress and not self._reload_blocked and self.session.can_replace
+            for widget, enabled_state in self.reload_widgets:
+                widget.configure(state=enabled_state if allowed else "disabled")
+            self.load_button.configure(state="normal" if allowed else "disabled")
+        self.notes.configure(state="disabled" if self.closing or self._reload_in_progress else "normal")
         stats=summary(rows)
         latency=stats["latency"]["policy_ms"]
         hz=stats["achieved_command_hz"]
@@ -276,7 +481,9 @@ class DeploymentGUI:
             for row in rendered:
                 self.table.insert("","end",values=row)
             self._rows_seen=rendered
-        details=json.dumps({"policy":self.session.policy.metadata,"embodiment":self.session.embodiment.metadata,"results":str(self.session.folder)},indent=2)
+        details=json.dumps({"policy":self.session.policy.metadata,"embodiment":self.session.embodiment.metadata,
+                            "selection":self.session.config.metadata.get("reload_selection", {}),
+                            "results":str(self.session.folder)},indent=2)
         if details!=self._details_seen:
             self.details.configure(state="normal")
             self.details.delete("1.0","end")
@@ -288,7 +495,9 @@ class DeploymentGUI:
             self._show_images([latest.images[r] for r in self.session.config.camera_roles],self.camera_labels)
         if self.reference_images:
             self._show_images(self.reference_images,self.reference_labels)
-        if self.closing and not self.session.worker.is_alive():
+        if (self.closing and self.session.shutdown_complete and not self._reload_in_progress
+                and (self._reload_cleanup_session is None or self._reload_cleanup_session.shutdown_complete)
+                and (self._reload_thread is None or not self._reload_thread.is_alive())):
             self.root.destroy()
             return
         self.root.after(100,self.refresh)
@@ -298,5 +507,6 @@ class DeploymentGUI:
             return
         self.save()
         self.closing=True
+        self._reload_cancel.set()
         self.status.set("Stopping policy commands, finalizing recordings and closing devices")
         self.session.close()
