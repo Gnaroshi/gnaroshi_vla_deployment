@@ -7,6 +7,7 @@ import queue
 import shutil
 import threading
 import time
+import traceback
 import uuid
 from .contracts import SessionConfig
 import numpy as np
@@ -30,6 +31,7 @@ class DeploymentSession:
         self.results, self.rows = [], []
         self.latest = None
         self.error = None
+        self.error_detail = None
         self._stop_thread = None
         self._stop_threads = []
         self._stop_results = {}
@@ -41,6 +43,9 @@ class DeploymentSession:
         self._cleanup_started = False
         self._cleanup_failed = False
         self._policy_load_error = False
+        self._startup_error = False
+        self._preview_failed = False
+        self._policy_loader = None
         self._notes = ""
         self._sequence = 0
         self.manifest = {"config": config.asdict(), "source": provenance(self.repo),
@@ -61,6 +66,7 @@ class DeploymentSession:
     def shutdown_complete(self):
         with self.lock:
             return (self._started and not self.worker.is_alive() and self._cleanup_complete
+                    and (self._policy_loader is None or not self._policy_loader.is_alive())
                     and not any(thread.is_alive() for thread in self._stop_threads))
 
     @property
@@ -76,7 +82,7 @@ class DeploymentSession:
         with self.lock:
             if self._stop_failed or self._cleanup_failed or not self._stop_confirmed:
                 return False
-            if self.state == "READY" and not self.closing.is_set():
+            if self.state in {"READY", "SELECTING"} and not self.closing.is_set():
                 return True
             return self.replacement_closed and (self.state == "CLOSED" or
                                                 self.state == "ERROR" and self._policy_load_error)
@@ -87,8 +93,12 @@ class DeploymentSession:
         self.events.put({"kind": "state", "state": state, "detail": detail})
 
     def _journal(self, event, **fields):
-        with (self.folder / "events.jsonl").open("a") as log:
-            log.write(json.dumps({"time_ns": time.time_ns(), "event": event, **fields}, allow_nan=False)+"\n")
+        with self.lock:
+            with (self.folder / "events.jsonl").open("a") as log:
+                log.write(json.dumps({"time_ns": time.time_ns(), "event": event, **fields}, allow_nan=False)+"\n")
+
+    def record_event(self, event, **fields):
+        self._journal(event, **fields)
 
     def start_rollout(self):
         with self.lock:
@@ -192,6 +202,8 @@ class DeploymentSession:
             except Exception:
                 self.config.target_hz, self.config.max_steps = old
                 raise
+            if "reload_selection" in self.config.metadata:
+                self.config.metadata["reload_selection"].update(target_hz=self.config.target_hz, max_steps=self.config.max_steps)
             self.manifest["config"] = self.config.asdict()
             write_json(self.folder / "manifest.json", self.manifest)
 
@@ -220,9 +232,16 @@ class DeploymentSession:
             self.save()
             return True
 
-    def _preview(self):
+    def _preview(self, preview_only=False):
         started = time.perf_counter()
-        observation = self.embodiment.observe()
+        observation = self.embodiment.observe_preview() if preview_only else self.embodiment.observe()
+        if preview_only:
+            if np.asarray(observation.state).size:
+                raise ValueError("Camera preview must have an empty robot state")
+            observation.preview_only = True
+            observation.camera_metadata = {**observation.camera_metadata, "preview_only": True}
+        elif getattr(observation, "preview_only", False) or observation.camera_metadata.get("preview_only", False):
+            raise ValueError("Camera-only preview cannot be used as a policy observation")
         if any(role not in observation.images for role in self.config.camera_roles):
             raise ValueError("Observation is missing a configured camera role")
         for role,image in observation.images.items():
@@ -239,6 +258,45 @@ class DeploymentSession:
         if callable(check):
             check()
 
+    def _connect_policy_with_preview(self):
+        completed, outcome = threading.Event(), {}
+        def load():
+            try:
+                self.policy.connect()
+            except BaseException as error:
+                outcome["error"] = error if isinstance(error, Exception) else RuntimeError(str(error))
+            finally:
+                completed.set()
+        self._policy_loader = threading.Thread(target=load, name="policy-loader", daemon=True)
+        started, last_status = time.monotonic(), None
+        self._state("LOADING_POLICY", "Loading policy; camera preview is available")
+        self._policy_loader.start()
+        try:
+            while not completed.is_set():
+                if not self.closing.is_set():
+                    try:
+                        self._preview(preview_only=True)
+                    except Exception:
+                        self._preview_failed = True
+                        raise
+                    status = getattr(self.policy, "loading_status", "")
+                    status = status() if callable(status) else status
+                    elapsed = time.monotonic() - started
+                    detail = str(status or "Loading policy")
+                    rendered = f"{detail} ({elapsed:.0f}s) · camera preview only"
+                    if rendered != last_status:
+                        self.events.put({"kind": "policy_loading", "detail": rendered})
+                        self._journal("policy_loading", detail=detail, elapsed_s=round(elapsed, 1))
+                        last_status = rendered
+                completed.wait(.04)
+        finally:
+            if self._policy_loader.is_alive() and not completed.is_set():
+                self.closing.set()
+                self.cancel.set()
+            self._policy_loader.join()
+        if "error" in outcome:
+            raise outcome["error"]
+
     def _run(self):
         stage = "dependencies"
         try:
@@ -246,9 +304,30 @@ class DeploymentSession:
                 return
             if self.config.record_video:
                 import cv2  # Fail dependency validation before any device connects.
+            preview = (self.config.metadata.get("preview_before_policy", False)
+                       and callable(getattr(self.embodiment, "connect_preview", None))
+                       and callable(getattr(self.embodiment, "observe_preview", None)))
+            if preview:
+                stage = "preview"
+                self._state("CONNECTING_PREVIEW", "Opening cameras without robot control")
+                self.embodiment.connect_preview()
+                if self.closing.is_set():
+                    return
+            if self.config.metadata.get("defer_policy_load", False):
+                stage = "selection"
+                self._state("SELECTING", "Select a task and checkpoint, then Load checkpoint · policy and robot controls are not connected")
+                while not self.closing.is_set():
+                    if preview:
+                        self._preview(preview_only=True)
+                    self.closing.wait(.04)
+                return
             # Metadata validation belongs in policy.connect, before robot.connect.
             stage = "policy"
-            self.policy.connect()
+            if preview:
+                self._connect_policy_with_preview()
+            else:
+                self._state("CONNECTING", "Loading and validating the selected policy")
+                self.policy.connect()
             if self.closing.is_set():
                 return
             stage = "embodiment"
@@ -275,9 +354,12 @@ class DeploymentSession:
             if self.closing.is_set() and isinstance(error, InterruptedError):
                 self._journal("cancelled_startup", stage=stage)
             else:
-                self._policy_load_error = stage == "policy"
+                self._policy_load_error = stage == "policy" and not self._preview_failed
+                self._startup_error = stage != "running"
                 self.error = f"{type(error).__name__}: {error}"
-                self._journal("error", detail=self.error)
+                self.error_detail = traceback.format_exc()
+                self._journal("error", detail=self.error, traceback=self.error_detail,
+                              selection=self.config.metadata.get("reload_selection", {}))
                 self._state("ERROR", self.error)
         finally:
             with self.lock:

@@ -106,24 +106,59 @@ DeploymentGUI(root, session,
 
 `kind`는 `directory`, `file`, `text`, `choice`를 지원한다. 초기 선택은
 `config.metadata['reload_selection']`이 우선하며 각 field의 `value`가 기본값이다.
-선택 패널은 기본으로 접혀 있으며 헤더의 `Change checkpoint...`로 펼친다. Load 요청을 수락하면
-다시 접어 결과표·notes 공간을 확보한다. 로드 오류는 상태 표시줄에 남고 패널을 다시 열어 수정한다.
+선택 패널은 기본으로 접혀 있으며 헤더의 `Task / checkpoint...`로 펼친다. Load 요청을 수락하면
+다시 접어 결과표·notes 공간을 확보한다. 로드 오류는 패널을 열어 전체 traceback을 보여주며
+선택값과 오류를 해당 세션의 `events.jsonl`에도 기록한다.
 factory는 선택한 checkpoint/method를 config와 policy metadata에 명시하고, 필요한 경우
 checkpoint별 `output_root`를 정한다. factory에서 세션을 `start()`하지 않는다.
 factory가 정규화한 `reload_selection`은 그대로 보존하고 입력한 값은 `reload_request`에 기록한다.
 재로딩 후 선택 항목도 정규화한 경로와 설정으로 갱신한다.
 factory가 실패하면 자체 생성한 서버·프로세스도 정리한 뒤 예외를 반환해야 한다.
 
-Load checkpoint는 READY, 정상 종료된 세션 또는 정책 로드 단계에서 안전하게 종료된 ERROR에서
+Load checkpoint는 SELECTING, READY, 정상 종료된 세션 또는 정책 로드 단계에서 안전하게 종료된 ERROR에서
 활성화된다. 실행·home·stop 중에는 교체할 수 없다. GUI는 notes를 저장하고 기존 세션의
 worker 종료·장치 정지 확인·cleanup을 기다린 뒤 background thread에서 factory를 호출한다.
-새 세션은 같은 task와 camera roles를 유지하며 별도 결과 폴더를 사용한다. 창과 선택 항목은
+새 세션은 같은 camera roles를 유지하며 별도 결과 폴더를 사용한다. task/instruction/home은
+프로젝트 factory가 검증한 새 config로 바꿀 수 있다. 창과 선택 항목은
 유지하고 결과표·notes·측정·폴더 표시는 새 세션으로 바꾼다. 이전 결과·영상은 보존한다.
 
 잘못된 경로나 정책 로드 실패는 선택을 수정해 재시도할 수 있다. 추론·장치 오류, 정지 미확인,
 cleanup 실패는 교체를 차단한다. 로딩 중 Exit는 factory가 반환한 세션을 연결하지 않고 정리한 뒤
 창을 닫는다. 상태 검사는 `session.can_replace`, 교체 직전 종료 확인은
 `session.replacement_closed`, 종료 대기는 `session.shutdown_complete`로 구분한다.
+
+프로필·태스크와 JSON 양식은 프로젝트가 다음 optional callbacks로 정의한다. 공통 GUI에는
+논문별 기본값이나 설정 schema를 넣지 않는다.
+
+```python
+DeploymentGUI(root, session, reload_fields=fields, reload_factory=make_session,
+    selection_resolver=resolve_selection,  # (selection, changed_key) -> dict
+    config_loader=load_config,            # (Path) -> dict
+    config_saver=save_config,             # (Path, selection) -> None
+    config_directory=config_directory)
+```
+
+choice 변경과 Browse 뒤에는 field key로 resolver를 호출한다. JSON Load, 정책 Load, JSON Save는
+각각 `config`, `load`, `save` key로 검증한다. 화면 field와 함께 `reload_selection`의 모든 숨은
+설정도 전달한다. Runtime Apply는 context의 target Hz/max steps도 갱신한다. JSON Load는
+선택 설정만 바꾸며 실제 적용은 Load checkpoint로 수행한다.
+
+### 정책 로딩 중 카메라 미리보기
+
+`config.metadata['preview_before_policy']=True`이고 adapter가 `connect_preview/observe_preview`를
+제공하면 카메라만 먼저 연다. 정책 로드는 별도 loader thread에서 수행하고 세션 worker는
+카메라를 갱신한다. optional `policy.loading_status` 문자열 또는 callable의 실제 단계와 경과
+시간을 GUI·journal에 표시한다. 정책 connect와 metadata 검증이 성공한 뒤에만 일반
+`embodiment.connect()`로 로봇 제어를 연결한다. UR5e 미리보기는 RTDE·gripper를 연결하지 않는다.
+
+미리보기 관측은 빈 state와 `preview_only=True` 표식을 가지며 policy 입력으로 거절한다.
+Start는 READY에서만 활성화된다. Exit·카메라 오류·정책 실패 때에도 loader가 끝난 뒤 policy와
+센서를 정리한다. 정책 adapter의 connect는 유한 deadline과 cancellation을 지원해야 한다.
+
+처음 태스크부터 선택하려면 `config.metadata['defer_policy_load']=True`를 함께 지정한다.
+GUI는 선택 패널을 펼치고 SELECTING에서 카메라만 갱신한다. 정책·로봇 제어는 연결하지 않는다.
+Load factory는 선택한 config의 `defer_policy_load=False`로 새 세션을 반환한다. 이 opt-in이
+없으면 기존처럼 자동 로드한다. 미리보기를 지원하지 않는 adapter는 SELECTING에서 영상 없이 대기한다.
 
 UR5e 연결 단계는 gripper 상태를 읽으며 activation은 operator Start 이후에 수행한다.
 activation 자체가 손가락 움직임을 만들 수 있다. 별도 Python open–close calibration 루프는 없다.

@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import queue
 import threading
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageTk
@@ -14,10 +15,16 @@ from .session import DeploymentSession
 
 
 class DeploymentGUI:
-    def __init__(self, root, session, *, reload_fields=None, reload_factory=None):
+    def __init__(self, root, session, *, reload_fields=None, reload_factory=None,
+                 selection_resolver=None, config_loader=None, config_saver=None, config_directory=None):
         self.root, self.session = root, session
         self.reload_fields = tuple(reload_fields or ())
         self.reload_factory = reload_factory
+        self.selection_resolver = selection_resolver
+        self.config_loader, self.config_saver = config_loader, config_saver
+        self.config_directory = Path(config_directory).expanduser() if config_directory is not None else None
+        self._selection_context = copy.deepcopy(session.config.metadata.get("reload_selection", {}))
+        self._load_error_session = None
         if bool(self.reload_fields) != bool(reload_factory):
             raise ValueError("Checkpoint selection requires both reload_fields and reload_factory")
         keys = [field["key"] for field in self.reload_fields]
@@ -64,7 +71,7 @@ class DeploymentGUI:
         self.heading_label.grid(row=0, column=0, sticky="w")
         ttk.Label(heading, textvariable=self.state, font=("DejaVu Sans", 12, "bold")).grid(row=0, column=1, padx=16)
         if self.reload_fields:
-            self.checkpoint_toggle = ttk.Button(heading, text="Change checkpoint...", command=self.toggle_checkpoint_panel)
+            self.checkpoint_toggle = ttk.Button(heading, text="Task / checkpoint...", command=self.toggle_checkpoint_panel)
             self.checkpoint_toggle.grid(row=0, column=2, padx=(0, 8))
         ttk.Button(heading, text="Exit", command=self.close).grid(row=0, column=3 if self.reload_fields else 2)
         self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1200)
@@ -164,6 +171,7 @@ class DeploymentGUI:
             ttk.Label(panel, text=field.get("label", key)).grid(row=row, column=0, sticky="w", padx=(0, 8))
             if kind == "choice":
                 widget = ttk.Combobox(panel, textvariable=variable, values=field.get("choices", ()), state="readonly")
+                widget.bind("<<ComboboxSelected>>", lambda _event, key=key:self.resolve_selection(key))
             else:
                 widget = ttk.Entry(panel, textvariable=variable)
             widget.grid(row=row, column=1, sticky="ew", pady=2)
@@ -174,8 +182,20 @@ class DeploymentGUI:
                 self.reload_widgets.append((button, "normal"))
         self.load_button = ttk.Button(panel, text="Load checkpoint", command=self.load_checkpoint)
         self.load_button.grid(row=0, column=3, rowspan=max(1, len(self.reload_fields)), padx=(10, 0), sticky="ns")
-        self._record_selection(self.session, {key:value.get() for key,value in self.reload_vars.items()})
-        self._set_checkpoint_expanded(False)
+        files = ttk.Frame(panel)
+        files.grid(row=len(self.reload_fields), column=0, columnspan=4, sticky="w", pady=(6, 0))
+        for title, callback, enabled in (("Load config JSON", self.load_config, self.config_loader),
+                                         ("Save config JSON", self.save_config, self.config_saver)):
+            if enabled:
+                button = ttk.Button(files, text=title, command=callback)
+                button.pack(side="left", padx=(0, 6))
+                self.reload_widgets.append((button, "normal"))
+        self.load_error = tk.Text(panel, height=4, wrap="word", relief="flat", font=("DejaVu Sans", 9))
+        self.load_error.grid(row=len(self.reload_fields)+1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.load_error.configure(state="disabled")
+        self.load_error.grid_remove()
+        self._record_selection(self.session, self.current_selection())
+        self._set_checkpoint_expanded(bool(self.session.config.metadata.get("defer_policy_load", False)))
 
     def _set_checkpoint_expanded(self, expanded):
         self._checkpoint_expanded = expanded
@@ -183,11 +203,96 @@ class DeploymentGUI:
             self.checkpoint_panel.grid()
         else:
             self.checkpoint_panel.grid_remove()
-        self.checkpoint_toggle.configure(text="Hide checkpoint settings" if expanded else "Change checkpoint...")
+        self.checkpoint_toggle.configure(text="Hide task / checkpoint" if expanded else "Task / checkpoint...")
 
     def toggle_checkpoint_panel(self):
         if not self.closing:
             self._set_checkpoint_expanded(not self._checkpoint_expanded)
+
+    def current_selection(self):
+        selection = copy.deepcopy(self._selection_context)
+        selection.update({key:value.get() for key,value in self.reload_vars.items()})
+        return selection
+
+    def _apply_selection(self, selection):
+        if not isinstance(selection, dict):
+            raise TypeError("Selection callbacks must return a dictionary")
+        self._selection_context = copy.deepcopy(selection)
+        for key, value in selection.items():
+            if key in self.reload_vars:
+                self.reload_vars[key].set(str(value))
+
+    def resolve_selection(self, changed_key):
+        try:
+            selected = self.current_selection()
+            if self.selection_resolver:
+                selected = self.selection_resolver(selected, changed_key)
+            self._apply_selection(selected)
+            return True
+        except Exception as error:
+            self._selection_error("Selection", error)
+            return False
+
+    def _show_load_error(self, message, detail=None):
+        self.status.set(message)
+        if self.reload_fields:
+            self.load_error.configure(state="normal")
+            self.load_error.delete("1.0", "end")
+            self.load_error.insert("1.0", detail or message)
+            self.load_error.configure(state="disabled")
+            self.load_error.grid()
+            self._set_checkpoint_expanded(True)
+
+    def _selection_error(self, operation, error):
+        detail = traceback.format_exc()
+        message = f"{operation} failed: {type(error).__name__}: {error}"
+        self.session.record_event("selection_error", operation=operation, detail=message,
+                                  traceback=detail, selection=self.current_selection())
+        self._show_load_error(message, detail)
+
+    def _selection_editable(self):
+        return (not self.closing and not self._reload_in_progress and not self._reload_blocked
+                and self.session.can_replace)
+
+    def load_config(self, path=None):
+        if not self.config_loader or not self._selection_editable():
+            return False
+        if path is None:
+            path = filedialog.askopenfilename(parent=self.root, title="Load deployment config",
+                initialdir=str(self.config_directory) if self.config_directory else None,
+                filetypes=[("JSON", "*.json"), ("All files", "*")])
+        if not path:
+            return False
+        try:
+            selected = self.config_loader(Path(path))
+            if self.selection_resolver:
+                selected = self.selection_resolver(selected, "config")
+            self._apply_selection(selected)
+            self.session.record_event("config_loaded", path=str(path), selection=selected)
+            self.status.set(f"Loaded configuration: {path}. Load checkpoint to apply it")
+            return True
+        except Exception as error:
+            self._selection_error("Config load", error)
+            return False
+
+    def save_config(self, path=None):
+        if not self.config_saver or not self._selection_editable() or not self.resolve_selection("save"):
+            return False
+        if path is None:
+            path = filedialog.asksaveasfilename(parent=self.root, title="Save deployment config",
+                initialdir=str(self.config_directory) if self.config_directory else None,
+                defaultextension=".json", filetypes=[("JSON", "*.json")])
+        if not path:
+            return False
+        try:
+            selected = self.current_selection()
+            self.config_saver(Path(path), selected)
+            self.session.record_event("config_saved", path=str(path), selection=selected)
+            self.status.set(f"Configuration saved: {path}")
+            return True
+        except Exception as error:
+            self._selection_error("Config save", error)
+            return False
 
     @staticmethod
     def _record_selection(session, selection):
@@ -207,15 +312,20 @@ class DeploymentGUI:
         chosen = (filedialog.askdirectory if field["kind"] == "directory" else filedialog.askopenfilename)(**options)
         if chosen:
             self.reload_vars[field["key"]].set(chosen)
+            self.resolve_selection(field["key"])
 
     def load_checkpoint(self):
         if not self.reload_factory or self.closing or self._reload_in_progress or self._reload_blocked or not self.session.can_replace:
             return False
+        if not self.resolve_selection("load"):
+            return False
         self.save()
-        selection = {key:value.get() for key,value in self.reload_vars.items()}
+        selection = self.current_selection()
+        self.session.record_event("reload_requested", selection=selection)
         previous, previous_config = self.session, copy.deepcopy(self.session.config)
         self._reload_in_progress = True
         self._set_checkpoint_expanded(False)
+        self.load_error.grid_remove()
         self.status.set("Closing the current session before loading the selected checkpoint")
         self._reload_thread = threading.Thread(target=self._reload, args=(previous, selection, previous_config),
                                                name="checkpoint-loader", daemon=True)
@@ -238,8 +348,7 @@ class DeploymentGUI:
                 raise TypeError("reload_factory must return a new unstarted DeploymentSession")
             if candidate.worker.ident is not None:
                 raise RuntimeError("reload_factory returned an already-started session")
-            if candidate.config.task != previous.config.task:
-                raise ValueError("Checkpoint changes must keep the selected task")
+            candidate.config.validate()
             if candidate.config.camera_roles != previous.config.camera_roles:
                 raise ValueError("Checkpoint changes must keep the configured camera roles")
             if candidate.folder == previous.folder:
@@ -254,7 +363,10 @@ class DeploymentGUI:
                     break
             handed_off = decision["accepted"]
         except Exception as error:
-            self._reload_events.put(("error", f"Checkpoint load failed: {type(error).__name__}: {error}"))
+            detail = traceback.format_exc()
+            message = f"Checkpoint load failed: {type(error).__name__}: {error}"
+            previous.record_event("reload_error", detail=message, traceback=detail, selection=selection)
+            self._reload_events.put(("error", message, detail))
         finally:
             try:
                 if isinstance(candidate, DeploymentSession) and candidate is not previous and not handed_off:
@@ -278,9 +390,7 @@ class DeploymentGUI:
         self.folder_label.configure(text=str(session.folder))
         self.hz.set(str(session.config.target_hz))
         self.steps.set(str(session.config.max_steps))
-        for key, value in session.config.metadata.get("reload_selection", {}).items():
-            if key in self.reload_vars:
-                self.reload_vars[key].set(str(value))
+        self._apply_selection(session.config.metadata.get("reload_selection", {}))
         self._set_checkpoint_expanded(False)
         self.notes.configure(state="normal")
         self.notes.delete("1.0", "end")
@@ -317,7 +427,9 @@ class DeploymentGUI:
                 self._reload_in_progress = False
             elif kind == "blocked":
                 self._reload_blocked = True
-                self.status.set(event[1])
+                self._show_load_error(event[1])
+            elif kind == "error" and not self.closing:
+                self._show_load_error(event[1], event[2] if len(event)>2 else None)
             elif not self.closing:
                 self.status.set(event[1])
 
@@ -413,6 +525,7 @@ class DeploymentGUI:
             if self.closing or self._reload_in_progress:
                 raise RuntimeError("Wait for checkpoint loading to finish")
             self.session.apply_settings(self.hz.get(),self.steps.get())
+            self._selection_context.update(target_hz=self.session.config.target_hz, max_steps=self.session.config.max_steps)
             self.status.set("Runtime settings applied")
         except Exception as error:
             self.status.set(str(error))
@@ -463,6 +576,9 @@ class DeploymentGUI:
             rows=list(self.session.rows)
             results=list(self.session.results)
             latest=self.session.latest
+        if state == "ERROR" and self.session._startup_error and self._load_error_session is not self.session:
+            self._load_error_session = self.session
+            self._show_load_error(self.session.error, getattr(self.session, "error_detail", None))
         self.state.set("LOADING" if self._reload_in_progress and not self.closing else state)
         ready=state=="READY" and not self.closing and not self._reload_in_progress
         active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING"}

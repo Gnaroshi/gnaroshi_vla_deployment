@@ -9,6 +9,8 @@ import threading
 import time
 import tkinter as tk
 import unittest
+from unittest.mock import patch
+import numpy as np
 
 from gnaroshi_deployment.adapters.mock import MockEmbodiment, MockPolicy
 from gnaroshi_deployment.contracts import SessionConfig
@@ -326,8 +328,8 @@ class CheckpointReload(unittest.TestCase):
                 return False
         candidates = []
         def factory(selection, previous):
-            # Invalid task is rejected before start; its cleanup must still be safe.
-            candidate = self.make_session(config=replace(previous, task="different_task"),
+            # Changed camera roles are rejected before start; cleanup must still be safe.
+            candidate = self.make_session(config=replace(previous, camera_roles=("other",)),
                                           embodiment=RejectStop())
             candidates.append(candidate)
             return candidate
@@ -341,6 +343,111 @@ class CheckpointReload(unittest.TestCase):
         self.assertFalse(self.app.load_checkpoint())
         self.assertEqual(len(candidates), 1)
         self.assertEqual(candidates[0].policy.connect_calls, 0)
+
+    def test_task_change_uses_validated_factory_config_and_rebinds(self):
+        def factory(selection, previous):
+            config = replace(previous, task="second_task", instruction="Run another mock task",
+                             metadata={"reload_selection": {**selection, "task": "second_task"}})
+            return self.make_session(config=config)
+        old = self.launch(factory=factory)
+        self.assertTrue(self.app.load_checkpoint())
+        self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
+                  and not self.app._reload_in_progress)
+        self.assertEqual(self.app.session.config.task, "second_task")
+        self.assertEqual(self.app.instruction_label.cget("text"), "Run another mock task")
+        self.assertIn("second_task", self.root.title())
+        self.assertTrue(old.replacement_closed)
+
+    def test_selection_callbacks_preserve_hidden_context_and_runtime_apply(self):
+        calls, saved = [], []
+        def resolver(selection, key):
+            calls.append((key, copy.deepcopy(selection)))
+            return {**selection, "resolved_config": {"recipe": "selected"}}
+        def loader(path):
+            return {"checkpoint": "checkpoint_from_file", "target_hz": 15, "max_steps": 17,
+                    "resolved_config": {"recipe": "from_file"}}
+        def saver(path, selection):
+            saved.append((path, copy.deepcopy(selection)))
+        old = self.make_session()
+        self.app = DeploymentGUI(self.root, old,
+            reload_fields=[{"key": "checkpoint", "kind": "directory"},
+                           {"key": "profile", "kind": "choice", "choices": ["initial", "other"], "value": "initial"}],
+            reload_factory=self.replacement,
+            selection_resolver=resolver, config_loader=loader, config_saver=saver,
+            config_directory=Path(self.temporary.name))
+        self.wait(lambda: old.state == "READY")
+        self.app.reload_vars["profile"].set("other")
+        choice = next(widget for widget, _ in self.app.reload_widgets if widget.winfo_class() == "TCombobox")
+        choice.event_generate("<<ComboboxSelected>>")
+        self.root.update()
+        self.assertEqual(calls[-1][0], "profile")
+        with patch("gnaroshi_deployment.gui.filedialog.askdirectory", return_value="from_browser"):
+            self.app.browse_checkpoint({"key": "checkpoint", "kind": "directory"})
+        self.assertEqual(calls[-1][0], "checkpoint")
+        self.assertTrue(self.app.load_config(Path(self.temporary.name)/"input.json"))
+        self.assertEqual(self.app.reload_vars["checkpoint"].get(), "checkpoint_from_file")
+        self.assertEqual(self.app.current_selection()["max_steps"], 17)
+        self.assertTrue(self.app.save_config(Path(self.temporary.name)/"output.json"))
+        self.assertEqual(saved[-1][1]["target_hz"], 15)
+        self.assertIn("resolved_config", saved[-1][1])
+        self.app.hz.set("30")
+        self.app.steps.set("23")
+        self.app.apply_settings()
+        self.assertEqual(old.config.metadata["reload_selection"]["target_hz"], 30)
+        self.assertEqual(self.app.current_selection()["max_steps"], 23)
+        self.assertTrue(self.app.load_checkpoint())
+        self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
+                  and not self.app._reload_in_progress)
+        self.assertEqual(self.app.session.config.metadata["reload_selection"]["target_hz"], 30)
+        self.assertIn("resolved_config", self.app.session.config.metadata["reload_selection"])
+        self.assertTrue(any(key == "config" for key, _ in calls))
+
+    def test_deferred_selection_loads_only_the_selected_policy_once(self):
+        class CameraPreview(CountEmbodiment):
+            def connect_preview(self):
+                pass
+            def observe_preview(self):
+                observation = super().observe()
+                observation.state = np.empty(0, np.float32)
+                return observation
+        old = self.make_session(embodiment=CameraPreview())
+        old.config.metadata.update(preview_before_policy=True, defer_policy_load=True)
+        candidates = []
+        def factory(selection, previous):
+            metadata = copy.deepcopy(previous.metadata)
+            metadata.update(defer_policy_load=False, reload_selection=selection)
+            candidate = self.make_session(config=replace(previous, metadata=metadata), embodiment=CameraPreview())
+            candidates.append(candidate)
+            return candidate
+        self.app = DeploymentGUI(self.root, old, reload_fields=[{"key": "checkpoint", "kind": "directory"}],
+                                 reload_factory=factory)
+        self.wait(lambda: old.state == "SELECTING" and old.latest is not None)
+        self.assertTrue(self.app._checkpoint_expanded)
+        self.assertEqual(old.policy.connect_calls, 0)
+        self.assertEqual(old.embodiment.connect_calls, 0)
+        self.assertFalse(self.app.start())
+        self.app.reload_vars["checkpoint"].set("selected_checkpoint")
+        self.assertTrue(self.app.load_checkpoint())
+        self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
+                  and not self.app._reload_in_progress)
+        self.assertEqual(candidates[0].policy.connect_calls, 1)
+        self.assertEqual(old.policy.connect_calls, 0)
+        self.assertTrue(old.replacement_closed)
+        self.assertFalse(self.app._checkpoint_expanded)
+
+    def test_reload_error_opens_panel_and_journals_full_selection(self):
+        def factory(selection, previous):
+            raise ValueError("Full diagnostic for selected checkpoint")
+        old = self.launch(factory=factory)
+        self.app._selection_context["resolved_config"] = {"recipe": "retained"}
+        self.assertTrue(self.app.load_checkpoint())
+        self.wait(lambda: not self.app._reload_in_progress)
+        self.assertTrue(self.app._checkpoint_expanded)
+        self.assertIn("Full diagnostic", self.app.load_error.get("1.0", "end"))
+        events = [json.loads(line) for line in (old.folder/"events.jsonl").read_text().splitlines()]
+        failure = next(row for row in events if row["event"] == "reload_error")
+        self.assertEqual(failure["selection"]["resolved_config"], {"recipe": "retained"})
+        self.assertIn("ValueError", failure["traceback"])
 
     def test_saved_outcome_notes_and_media_survive_with_new_result_isolation(self):
         old = self.launch()

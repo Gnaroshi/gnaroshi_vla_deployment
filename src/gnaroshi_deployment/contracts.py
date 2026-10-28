@@ -51,7 +51,11 @@ class SessionConfig:
 
 
 class Policy(Protocol):
-    """All calls except metadata are owned by the session worker thread.
+    """Calls are serialized by the session worker.
+
+    For an opted-in sensor preview, connect may run on the session policy-loader
+    while the worker reads cameras. Device control waits for connect to finish,
+    and policy close waits for the loader to terminate.
 
     infer must return under a finite adapter-defined deadline. Cancellation never
     automatically retries an uncertain request or applies its eventual response.

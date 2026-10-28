@@ -1,7 +1,7 @@
 """Explicit two-RealSense UR5e adapter for tool-local relative EEF actions.
 
 The owning project supplies its robot address, task home and camera serial roles.
-Device imports and connections occur only in connect(); model code is separate.
+Camera-only preview is separate from policy-gated control connections.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -136,21 +136,31 @@ class UR5eEmbodiment:
         self.last_gripper_position=None
         self.last_gripper_time=0.0
 
-    def connect(self):
+    def connect_preview(self):
+        """Open RGB cameras only; never import/connect robot or gripper drivers."""
         import pyrealsense2 as rs
-        import rtde_control
-        import rtde_receive
-        from scipy.spatial.transform import Rotation
-        self.Rotation=Rotation
         self.rs=rs
         try:
             for role,serial in self.config.camera_serials.items():
+                if role in self.cameras:
+                    continue
                 pipeline=rs.pipeline()
                 cfg=rs.config()
                 cfg.enable_device(serial)
                 cfg.enable_stream(rs.stream.color,self.config.width,self.config.height,rs.format.rgb8,self.config.camera_fps)
-                pipeline.start(cfg)
                 self.cameras[role]=pipeline
+                pipeline.start(cfg)
+        except BaseException:
+            self.close()
+            raise
+
+    def connect(self):
+        self.connect_preview()
+        import rtde_control
+        import rtde_receive
+        from scipy.spatial.transform import Rotation
+        self.Rotation=Rotation
+        try:
             self.receive=rtde_receive.RTDEReceiveInterface(self.config.robot_ip)
             self.control=rtde_control.RTDEControlInterface(self.config.robot_ip)
             self.gripper=Gripper(self.config.robot_ip)
@@ -170,7 +180,7 @@ class UR5eEmbodiment:
         euler=self.Rotation.from_rotvec(tcp[3:]).as_euler("xyz")
         return np.r_[tcp[:3],euler,self.gripper.get("POS")/255].astype(np.float32)
 
-    def observe(self):
+    def _images(self):
         images,metadata={},{}
         for role,pipeline in self.cameras.items():
             frame=pipeline.wait_for_frames(timeout_ms=1000).get_color_frame()
@@ -179,6 +189,17 @@ class UR5eEmbodiment:
             images[role]=np.asanyarray(frame.get_data()).copy()
             metadata[role]={"serial":self.config.camera_serials[role],"frame_number":frame.get_frame_number(),
                             "device_timestamp_ms":frame.get_timestamp(),"timestamp_domain":str(frame.get_frame_timestamp_domain())}
+        return images, metadata
+
+    def observe_preview(self):
+        images, metadata = self._images()
+        metadata["preview_only"] = True
+        observation = Observation(images, np.empty(0, dtype=np.float32), time.time_ns(), metadata, time.monotonic_ns())
+        observation.preview_only = True
+        return observation
+
+    def observe(self):
+        images, metadata = self._images()
         return Observation(images,self._state(),time.time_ns(),metadata,time.monotonic_ns())
 
     def _servo(self,joints):
