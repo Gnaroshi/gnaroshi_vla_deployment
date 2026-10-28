@@ -63,9 +63,12 @@ class DeploymentGUI:
         self.heading_label = ttk.Label(heading, text=f"{session.config.task.title()}  /  {session.config.method}", font=("DejaVu Sans", 18, "bold"))
         self.heading_label.grid(row=0, column=0, sticky="w")
         ttk.Label(heading, textvariable=self.state, font=("DejaVu Sans", 12, "bold")).grid(row=0, column=1, padx=16)
-        ttk.Button(heading, text="Exit", command=self.close).grid(row=0, column=2)
+        if self.reload_fields:
+            self.checkpoint_toggle = ttk.Button(heading, text="Change checkpoint…", command=self.toggle_checkpoint_panel)
+            self.checkpoint_toggle.grid(row=0, column=2, padx=(0, 8))
+        ttk.Button(heading, text="Exit", command=self.close).grid(row=0, column=3 if self.reload_fields else 2)
         self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1200)
-        self.instruction_label.grid(row=1, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        self.instruction_label.grid(row=1, column=0, columnspan=4 if self.reload_fields else 3, sticky="w", pady=(12, 0))
         if self.reload_fields:
             self._checkpoint_panel(heading)
         body = ttk.Frame(root, padding=(18,0,18,12))
@@ -150,8 +153,8 @@ class DeploymentGUI:
         root.after(80,self.refresh)
 
     def _checkpoint_panel(self, parent):
-        panel = ttk.LabelFrame(parent, text="Policy selection · load while stopped", padding=8)
-        panel.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.checkpoint_panel = panel = ttk.LabelFrame(parent, text="Policy selection · load while stopped", padding=8)
+        panel.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         panel.columnconfigure(1, weight=1)
         selected = self.session.config.metadata.get("reload_selection", {})
         for row, field in enumerate(self.reload_fields):
@@ -172,6 +175,19 @@ class DeploymentGUI:
         self.load_button = ttk.Button(panel, text="Load checkpoint", command=self.load_checkpoint)
         self.load_button.grid(row=0, column=3, rowspan=max(1, len(self.reload_fields)), padx=(10, 0), sticky="ns")
         self._record_selection(self.session, {key:value.get() for key,value in self.reload_vars.items()})
+        self._set_checkpoint_expanded(False)
+
+    def _set_checkpoint_expanded(self, expanded):
+        self._checkpoint_expanded = expanded
+        if expanded:
+            self.checkpoint_panel.grid()
+        else:
+            self.checkpoint_panel.grid_remove()
+        self.checkpoint_toggle.configure(text="Hide checkpoint settings" if expanded else "Change checkpoint…")
+
+    def toggle_checkpoint_panel(self):
+        if not self.closing:
+            self._set_checkpoint_expanded(not self._checkpoint_expanded)
 
     @staticmethod
     def _record_selection(session, selection):
@@ -199,6 +215,7 @@ class DeploymentGUI:
         selection = {key:value.get() for key,value in self.reload_vars.items()}
         previous, previous_config = self.session, copy.deepcopy(self.session.config)
         self._reload_in_progress = True
+        self._set_checkpoint_expanded(False)
         self.status.set("Closing the current session before loading the selected checkpoint")
         self._reload_thread = threading.Thread(target=self._reload, args=(previous, selection, previous_config),
                                                name="checkpoint-loader", daemon=True)
@@ -264,6 +281,7 @@ class DeploymentGUI:
         for key, value in session.config.metadata.get("reload_selection", {}).items():
             if key in self.reload_vars:
                 self.reload_vars[key].set(str(value))
+        self._set_checkpoint_expanded(False)
         self.notes.configure(state="normal")
         self.notes.delete("1.0", "end")
         self._rows_seen, self._details_seen = None, None
@@ -457,6 +475,7 @@ class DeploymentGUI:
             widget.configure(state="normal" if ready else "disabled")
         self.delete_button.configure(state="normal" if ready and results else "disabled")
         if self.reload_fields:
+            self.checkpoint_toggle.configure(state="disabled" if self.closing else "normal")
             allowed = not self.closing and not self._reload_in_progress and not self._reload_blocked and self.session.can_replace
             for widget, enabled_state in self.reload_widgets:
                 widget.configure(state=enabled_state if allowed else "disabled")

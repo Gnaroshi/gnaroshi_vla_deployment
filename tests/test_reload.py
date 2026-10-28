@@ -169,6 +169,44 @@ class CheckpointReload(unittest.TestCase):
         self.assertEqual(self.app.session.config.metadata["reload_selection"],
                          {"checkpoint": "checkpoint_b"})
 
+    def test_checkpoint_panel_is_collapsed_and_restores_result_space_after_load(self):
+        old = self.make_session()
+        self.app = DeploymentGUI(self.root, old, reload_fields=[
+            {"key": "checkpoint", "label": "Checkpoint", "kind": "directory"},
+            {"key": "mode", "label": "Mode", "kind": "choice", "choices": ["default"], "value": "default"},
+            {"key": "config", "label": "Config", "kind": "file"},
+            {"key": "description", "label": "Description", "kind": "text"},
+        ], reload_factory=self.replacement)
+        self.wait(lambda: old.state == "READY")
+        self.root.deiconify()
+        self.root.geometry("1440x960")
+        self.root.update()
+        self.assertFalse(self.app._checkpoint_expanded)
+        self.assertFalse(self.app.checkpoint_panel.grid_info())
+        notebook = self.app.table.master.master
+        for widget in (self.app.table, self.app.notes, self.app.details):
+            notebook.select(widget.master)
+            self.root.update_idletasks()
+            self.assertGreaterEqual(widget.winfo_height(), 80)
+            self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
+                                 self.root.winfo_rooty() + self.root.winfo_height())
+        self.app.checkpoint_toggle.invoke()
+        self.root.update_idletasks()
+        self.assertTrue(self.app._checkpoint_expanded)
+        self.assertTrue(self.app.checkpoint_panel.grid_info())
+        self.app.checkpoint_toggle.invoke()
+        self.assertFalse(self.app.checkpoint_panel.grid_info())
+        self.app.checkpoint_toggle.invoke()
+        self.app.reload_vars["checkpoint"].set("checkpoint_b")
+        self.assertTrue(self.app.load_checkpoint())
+        self.assertFalse(self.app._checkpoint_expanded)
+        self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
+                  and not self.app._reload_in_progress)
+        self.root.update_idletasks()
+        self.assertFalse(self.app.checkpoint_panel.grid_info())
+        self.assertEqual(self.app.reload_vars["checkpoint"].get(), "checkpoint_b")
+        self.assertGreaterEqual(self.app.details.winfo_height(), 80)
+
     def test_reload_is_blocked_during_home_rollout_and_stopping(self):
         home_entered, home_release = threading.Event(), threading.Event()
         stop_entered, stop_release = threading.Event(), threading.Event()
