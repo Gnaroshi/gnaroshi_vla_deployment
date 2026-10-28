@@ -359,6 +359,41 @@ class RecoverySessions(unittest.TestCase):
         self.assertFalse(session.can_recover)
         self.assertFalse(session.recover_robot())
 
+    def test_policy_failure_with_simultaneous_typed_stop_fault_remains_fatal(self):
+        class BadPolicy(KeptPolicy):
+            def infer(self, observation, instruction):
+                raise RuntimeError("Model transport failed")
+        embodiment = self.latched_stop_arm()
+        session = self.make(policy=BadPolicy(), embodiment=embodiment)
+        embodiment.fail_stop = True
+        session.start_rollout()
+        self.wait(lambda: session.shutdown_complete)
+        self.assertEqual(session.state, "ERROR")
+        self.assertIn("Model transport failed", session.error)
+        self.assertFalse(session.can_recover)
+        self.assertFalse(session.recover_robot())
+        self.assertEqual(session.policy.close_calls, 1)
+        result = json.loads(next(session.folder.glob("rollout_*/result.json")).read_text())
+        self.assertEqual(result["outcome"], "error")
+        self.assertFalse(result["recovery_required"])
+
+    def test_typed_stop_fault_at_max_steps_keeps_policy_for_recovery(self):
+        embodiment = self.latched_stop_arm()
+        session = self.make(embodiment=embodiment)
+        session.config.max_steps = 3
+        embodiment.fail_stop = True
+        session.start_rollout()
+        self.wait(lambda: session.state == "RECOVERY_REQUIRED" and session.can_recover)
+        self.assertEqual(session.policy.close_calls, 0)
+        self.assertEqual(len(session.rows), 3)
+        result = json.loads(next(session.folder.glob("rollout_*/result.json")).read_text())
+        self.assertEqual(result["outcome"], "error")
+        self.assertTrue(result["recovery_required"])
+        embodiment.fail_stop = False
+        embodiment.released = True
+        self.assertTrue(session.recover_robot())
+        self.wait(lambda: session.state == "READY")
+
     def test_device_fault_type_from_policy_cannot_enable_robot_recovery(self):
         class BadPolicy(KeptPolicy):
             def infer(self, observation, instruction):

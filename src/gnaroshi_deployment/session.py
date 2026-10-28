@@ -546,6 +546,7 @@ class DeploymentSession:
         recorder = None
         folder = None
         recoverable_error = None
+        fatal_rollout_error = False
         self.rows = []
         # Preserve a stop issued after Start but before worker dispatch.
         with self.lock:
@@ -607,6 +608,9 @@ class DeploymentSession:
                 self._stop_confirmed = bool(self.embodiment.stop())
                 if not self._stop_confirmed:
                     self._stop_failed=True
+                    fault = getattr(self.embodiment, "recovery_error", None)
+                    if isinstance(fault, RobotRecoveryRequired):
+                        raise fault
                     raise RuntimeError("Robot did not acknowledge stop at max_steps")
                 self._state("WAITING_OUTCOME", "Maximum steps reached; select Success, Failure, Stop or Retry")
                 while not self.cancel.wait(0.05):
@@ -621,6 +625,7 @@ class DeploymentSession:
                 recorder = RolloutRecorder(folder, self.config.target_hz, self.config.record_video)
             self._require_recovery(error)
         except Exception as error:
+            fatal_rollout_error = True
             self.error = f"{type(error).__name__}: {error}"
             self.request = "error"
             try:
@@ -636,7 +641,7 @@ class DeploymentSession:
             accepted_stop_outcome = None
             if not self._wait_for_stops():
                 fault = getattr(self.embodiment, "recovery_error", None)
-                if recoverable_error is None and isinstance(fault, RobotRecoveryRequired):
+                if not fatal_rollout_error and recoverable_error is None and isinstance(fault, RobotRecoveryRequired):
                     accepted_stop_outcome = self.request if self.request in {"success", "failure"} else None
                     recoverable_error = fault
                     if not self._recovery_fault:
