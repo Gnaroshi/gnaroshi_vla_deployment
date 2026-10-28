@@ -9,7 +9,7 @@ import threading
 import time
 import traceback
 import uuid
-from .contracts import SessionConfig
+from .contracts import RobotRecoveryRequired, SessionConfig
 import numpy as np
 from .records import RolloutRecorder, provenance, summary, write_json
 
@@ -46,6 +46,9 @@ class DeploymentSession:
         self._startup_error = False
         self._preview_failed = False
         self._policy_loader = None
+        self._recovery_fault = False
+        self._recovery_status = {}
+        self._rollout_active = False
         self._notes = ""
         self._sequence = 0
         self.manifest = {"config": config.asdict(), "source": provenance(self.repo),
@@ -67,6 +70,7 @@ class DeploymentSession:
         with self.lock:
             return (self._started and not self.worker.is_alive() and self._cleanup_complete
                     and (self._policy_loader is None or not self._policy_loader.is_alive())
+                    and not bool(getattr(self.embodiment, "recovery_pending", False))
                     and not any(thread.is_alive() for thread in self._stop_threads))
 
     @property
@@ -102,7 +106,7 @@ class DeploymentSession:
 
     def start_rollout(self):
         with self.lock:
-            if self.state != "READY":
+            if self.state != "READY" or self._recovery_fault:
                 return False
             # Reserve the state before queueing: double-click cannot queue two homes.
             self.state = "STARTING"
@@ -113,7 +117,12 @@ class DeploymentSession:
         if action not in {"success", "failure", "stop", "retry", "close"}:
             raise ValueError(action)
         with self.lock:
-            if action != "close" and self.state not in {"STARTING", "HOMING", "RUNNING", "WAITING_OUTCOME", "STOPPING"}:
+            if self._cleanup_started:
+                if action == "close":
+                    self.closing.set()
+                    self.cancel.set()
+                return False
+            if action != "close" and self.state not in {"STARTING", "HOMING", "RUNNING", "WAITING_OUTCOME", "STOPPING", "RECOVERY_REQUIRED", "RECOVERING"}:
                 return False
             if action in {"success", "failure"} and self.state not in {"RUNNING", "WAITING_OUTCOME"}:
                 return False
@@ -135,6 +144,99 @@ class DeploymentSession:
             self._stop_thread.start()
         self._journal("operator", action=action)
         return True
+
+    @property
+    def can_recover(self):
+        with self.lock:
+            return (self.state == "RECOVERY_REQUIRED" and self._recovery_fault and not self.closing.is_set()
+                    and not self._rollout_active
+                    and self.worker.is_alive() and not self._cleanup_failed
+                    and callable(getattr(self.embodiment, "recover", None))
+                    and not any(thread.is_alive() for thread in self._stop_threads))
+
+    def recover_robot(self):
+        with self.lock:
+            if not self.can_recover:
+                return False
+            self.request = "recover"
+            self.cancel.clear()
+            self.state = "RECOVERING"
+            generation = self._stop_generation
+        self._journal("robot_recovery_requested", stop_generation=generation)
+        self.commands.put(("recover", generation))
+        return True
+
+    def _require_recovery(self, error):
+        with self.lock:
+            self.error = f"{type(error).__name__}: {error}"
+            self.error_detail = traceback.format_exc()
+            self._recovery_fault = True
+            self._recovery_status = dict(error.status)
+            self.cancel.set()
+            if not self.closing.is_set():
+                self.request = "recovery_required"
+                self.state = "RECOVERY_REQUIRED"
+            self._stop_confirmed = False
+            self._stop_generation += 1
+            thread = threading.Thread(target=self._stop, args=(self._stop_generation,), name="recovery-stop", daemon=True)
+            self._stop_threads.append(thread)
+            thread.start()
+        self._journal("robot_recovery_required", detail=self.error, status=self._recovery_status,
+                      traceback=self.error_detail)
+        if not self.closing.is_set():
+            self._state("RECOVERY_REQUIRED", self.error+" · Release the fault on the teach pendant, then Recover robot")
+
+    def _recovery_cancelled(self, generation):
+        return (self.closing.is_set() or self.cancel.is_set() or self.request != "recover"
+                or generation != self._stop_generation)
+
+    def _recover_robot(self, generation):
+        if self._recovery_cancelled(generation):
+            return
+        # Model transport/reset errors retain the existing fatal-error behavior.
+        self._check_policy_ready()
+        try:
+            if any(thread.is_alive() for thread in self._stop_threads):
+                raise RuntimeError("Wait for all previous stop requests to finish")
+            report = self.embodiment.recover(self.cancel)
+            if self._recovery_cancelled(generation):
+                raise InterruptedError("Robot recovery cancelled")
+            if not isinstance(report, dict) or report.get("healthy") is not True or report.get("stop_confirmed") is not True:
+                with self.lock:
+                    self._stop_failed = True
+                    self._stop_confirmed = False
+                raise RuntimeError("Recovery did not verify fresh healthy state and acknowledged stop")
+        except Exception as error:
+            self.error_detail = traceback.format_exc()
+            self._journal("robot_recovery_failed", detail=f"{type(error).__name__}: {error}",
+                          status=getattr(error, "status", {}), traceback=self.error_detail)
+            if not self.closing.is_set():
+                self.error = f"Recovery failed: {type(error).__name__}: {error}"
+                self.cancel.set()
+                self._state("RECOVERY_REQUIRED", self.error)
+                self.save()
+            return
+        # Reset only after adapter verification. Never reuse the old action buffer.
+        self._policy_operation(self.policy.reset, f"recovery_{uuid.uuid4().hex}")
+        with self.lock:
+            if self._recovery_cancelled(generation) or any(thread.is_alive() for thread in self._stop_threads):
+                self._journal("robot_recovery_cancelled", stop_generation=generation, stage="policy_reset")
+                if not self.closing.is_set():
+                    self.cancel.set()
+                    self._state("RECOVERY_REQUIRED", "Recovery cancelled; robot remains stopped")
+                return
+            self._stop_failed = False
+            self._stop_confirmed = True
+            self._stop_threads.clear()
+            self._stop_results.clear()
+            self._recovery_fault = False
+            self._recovery_status = {}
+            self.error = self.error_detail = None
+            self.request = None
+            self.cancel.clear()
+            self._state("READY", "Robot recovery verified; press Start separately to move home and begin a new rollout")
+        self._journal("robot_recovery_succeeded", report=report)
+        self.save()
 
     def _stop(self,generation):
         try:
@@ -179,6 +281,12 @@ class DeploymentSession:
     def _ready_after_stop(self):
         while True:
             if not self._wait_for_stops():
+                fault = getattr(self.embodiment, "recovery_error", None)
+                if isinstance(fault, RobotRecoveryRequired):
+                    if not self._recovery_fault:
+                        self._require_recovery(fault)
+                    self.save()
+                    return
                 raise RuntimeError("Stop failed or timed out; restart this session after checking the robot")
             with self.lock:
                 if any(thread.is_alive() for thread in self._stop_threads):
@@ -256,7 +364,14 @@ class DeploymentSession:
     def _check_policy_ready(self):
         check = getattr(self.policy, "check_ready", None)
         if callable(check):
-            check()
+            self._policy_operation(check)
+
+    @staticmethod
+    def _policy_operation(operation, *args):
+        try:
+            return operation(*args)
+        except RobotRecoveryRequired as error:
+            raise RuntimeError(f"Policy operation failed: {error}") from error
 
     def _connect_policy_with_preview(self):
         completed, outcome = threading.Event(), {}
@@ -342,12 +457,28 @@ class DeploymentSession:
                     command = self.commands.get_nowait()
                 except queue.Empty:
                     command = None
-                if command == "start":
-                    self._rollout()
+                if command == "start" and not self._recovery_fault:
+                    self._rollout_active = True
+                    try:
+                        self._rollout()
+                    finally:
+                        self._rollout_active = False
+                elif isinstance(command, tuple) and command[0] == "recover":
+                    self._recover_robot(command[1])
                 elif self.state == "READY":
                     self._check_policy_ready()
-                    self._preview()
+                    try:
+                        self._preview()
+                    except RobotRecoveryRequired as error:
+                        self._require_recovery(error)
                     self.closing.wait(0.04)
+                elif self._recovery_fault:
+                    if self.state == "STOPPING" and not any(thread.is_alive() for thread in self._stop_threads):
+                        self._state("RECOVERY_REQUIRED", "Robot remains stopped; an explicit recovery is required")
+                    self._check_policy_ready()
+                    if callable(getattr(self.embodiment, "observe_preview", None)):
+                        self._preview(preview_only=True)
+                    self.closing.wait(.04)
                 else:
                     self.closing.wait(0.02)
         except Exception as error:
@@ -364,6 +495,15 @@ class DeploymentSession:
         finally:
             with self.lock:
                 self._cleanup_started = True
+            if (bool(getattr(self.embodiment, "recovery_pending", False))
+                    or any(thread.is_alive() for thread in self._stop_threads)):
+                self.events.put({"kind": "warning", "detail": "Waiting for the pending robot operation before closing devices"})
+                self._journal("waiting_for_native_robot_cleanup")
+                while (bool(getattr(self.embodiment, "recovery_pending", False))
+                       or any(thread.is_alive() for thread in self._stop_threads)):
+                    # Native SDK calls cannot be interrupted safely. Keep the GUI
+                    # responsive and let this owner finish cleanup after the call.
+                    time.sleep(.05)
             try:
                 try:
                     if self._stop_threads:
@@ -405,9 +545,12 @@ class DeploymentSession:
     def _rollout(self):
         recorder = None
         folder = None
+        recoverable_error = None
         self.rows = []
         # Preserve a stop issued after Start but before worker dispatch.
         with self.lock:
+            if self._recovery_fault:
+                return
             already_cancelled=self.cancel.is_set() or self.closing.is_set()
             if not already_cancelled:
                 self.request = None
@@ -424,7 +567,7 @@ class DeploymentSession:
             episode = f"rollout_{self._sequence:04d}_{uuid.uuid4().hex[:6]}"
             folder = self.folder / episode
             recorder = RolloutRecorder(folder, self.config.target_hz, self.config.record_video)
-            self.policy.reset(episode)
+            self._policy_operation(self.policy.reset, episode)
             if self.cancel.is_set():
                 raise InterruptedError("reset cancelled")
             self.embodiment.begin_episode()
@@ -437,7 +580,7 @@ class DeploymentSession:
                 if step==0:
                     recorder.prepare(observation.images)
                 prediction_started = time.perf_counter()
-                prediction = self.policy.infer(observation, self.config.instruction)
+                prediction = self._policy_operation(self.policy.infer, observation, self.config.instruction)
                 policy_ms = 1000*(time.perf_counter()-prediction_started)
                 if self.cancel.is_set():
                     self._journal("cancelled_prediction", step=step,
@@ -470,6 +613,13 @@ class DeploymentSession:
                     self._preview()
         except InterruptedError:
             pass
+        except RobotRecoveryRequired as error:
+            recoverable_error = error
+            if folder is None:
+                self._sequence += 1
+                folder = self.folder / f"rollout_{self._sequence:04d}_{uuid.uuid4().hex[:6]}"
+                recorder = RolloutRecorder(folder, self.config.target_hz, self.config.record_video)
+            self._require_recovery(error)
         except Exception as error:
             self.error = f"{type(error).__name__}: {error}"
             self.request = "error"
@@ -483,14 +633,24 @@ class DeploymentSession:
         finally:
             if recorder:
                 recorder.close()
+            accepted_stop_outcome = None
             if not self._wait_for_stops():
-                self.error=self.error or "Stop failed or timed out; automatic rearming disabled"
-            outcome = self.request
+                fault = getattr(self.embodiment, "recovery_error", None)
+                if recoverable_error is None and isinstance(fault, RobotRecoveryRequired):
+                    accepted_stop_outcome = self.request if self.request in {"success", "failure"} else None
+                    recoverable_error = fault
+                    if not self._recovery_fault:
+                        self._require_recovery(fault)
+                else:
+                    self.error=self.error or "Stop failed or timed out; automatic rearming disabled"
+            outcome = accepted_stop_outcome or ("error" if recoverable_error is not None else self.request)
             if folder and outcome in {"success", "failure", "error"}:
                 result = {"id": self._sequence, "outcome": outcome, "directory": folder.name,
                           "target_hz": self.config.target_hz, "max_steps": self.config.max_steps,
-                          "outcome_home": "pending" if outcome in {"success","failure"} else "not_requested",
-                          "stop_confirmed": self._stop_confirmed, "error": self.error, **summary(self.rows)}
+                          "outcome_home": ("blocked_recovery" if recoverable_error is not None and accepted_stop_outcome
+                                           else "pending" if outcome in {"success","failure"} else "not_requested"),
+                          "stop_confirmed": self._stop_confirmed, "error": self.error,
+                          "recovery_required": recoverable_error is not None, **summary(self.rows)}
                 write_json(folder / "result.json", result)
                 with self.lock:
                     if outcome != "error":
@@ -500,6 +660,9 @@ class DeploymentSession:
                 shutil.rmtree(folder)
                 self._journal("discard_rollout", directory=folder.name, reason=outcome)
             if self.closing.is_set():
+                return
+            if recoverable_error is not None:
+                self.save()
                 return
             if not self._stop_confirmed or self.error:
                 raise RuntimeError(self.error or "Arm stop was not confirmed; no home command issued")
@@ -516,6 +679,13 @@ class DeploymentSession:
                         result["outcome_home"] = "completed"
                     except InterruptedError:
                         result["outcome_home"] = "cancelled"
+                    except RobotRecoveryRequired as error:
+                        self._require_recovery(error)
+                        result.update(outcome_home="error", outcome_home_error=str(error), error=self.error,
+                                      recovery_required=True, stop_confirmed=False)
+                        write_json(folder / "result.json", result)
+                        self.save()
+                        return
                     except Exception as error:
                         result["outcome_home"] = "error"
                         result["outcome_home_error"] = str(error)

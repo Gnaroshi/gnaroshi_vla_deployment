@@ -81,6 +81,7 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 | Start `[N]` | task home → policy reset → fresh rollout |
 | Success `[S]`, Failure `[F]` | 명령 중단 → 수동 결과/영상 저장 → task home |
 | Stop `[X]`, Retry `[R]` | 현재 attempt 폐기 → 현 위치 유지 |
+| Recover robot | 보호정지 해제 후 상태·정지 확인 → 정책 버퍼 초기화 → READY |
 | Save `[W]` | 결과와 notes 저장 |
 | Delete last `[D]` | 확인 후 마지막 저장 결과/영상 삭제 |
 | Exit `[Esc]` | pending action 취소 → 미분류 attempt 폐기 → 장치 종료 |
@@ -163,6 +164,27 @@ Load factory는 선택한 config의 `defer_policy_load=False`로 새 세션을 �
 UR5e 연결 단계는 gripper 상태를 읽으며 activation은 operator Start 이후에 수행한다.
 activation 자체가 손가락 움직임을 만들 수 있다. 별도 Python open–close calibration 루프는 없다.
 하드웨어 adapter의 실제 수행 능력은 CPU mock 검증과 별개다.
+
+### 보호정지 뒤 GUI에서 복구
+
+adapter의 관측·home·episode 시작·명령 중 `RobotRecoveryRequired(reason, status=...)`가 발생하면
+아직 수동 분류하지 않은 rollout은 오류로 보존하고 성공률에서는 제외한다. 이미 Success/Failure를
+저장한 뒤 복귀 home에서 발생한 오류는 수동 결과를 유지하고 `outcome_home='error'`로 기록한다.
+세션은 RECOVERY_REQUIRED로 전환하며
+GUI·정책·카메라를 유지한다. Start, 성공/실패 분류, 자동 home과 checkpoint 교체는 차단한다.
+지원되는 adapter에서는 camera-only preview를 계속 표시한다.
+
+사용자가 티치펜던트에서 원인을 확인하고 보호정지를 해제한 뒤 Recover robot을 누른다.
+worker는 이전 stop thread가 모두 끝난 것을 확인한 후 `embodiment.recover(cancel_event)`를
+실행한다. 이 메서드는 새 상태와 정지 응답을 확인해 `{"healthy": True, "stop_confirmed": True}`를
+반환해야 한다. 자동 unlock·전원·브레이크 해제·dashboard play·home·gripper activation·arming을
+수행해서는 안 된다. 확인 실패는 원인을 표시하며 복구 대기 상태를 유지한다.
+
+검증 성공 뒤 정책의 새 episode reset으로 이전 action buffer를 버리고 READY로 돌아간다.
+모델을 다시 로드하거나 로봇을 이동하지 않는다. 다음 Start는 사용자가 별도로 누른다.
+Stop·Exit는 복구를 취소하며 늦은 응답으로 재무장하지 않는다. 정책 오류와 일반 정지 미확인
+오류는 이 경로를 활성화하지 않는다. 기존 sticky 실패 표시는 typed fault의 명시적 복구에서
+새로운 정상 상태·정지 확인·정책 reset이 모두 성공했을 때에만 해제한다.
 
 ## 기록과 영상
 

@@ -8,6 +8,13 @@ from typing import Protocol
 import numpy as np
 
 
+class RobotRecoveryRequired(RuntimeError):
+    """A typed device fault requiring an explicit, motion-free operator recovery."""
+    def __init__(self, reason: str, *, status: dict | None = None):
+        super().__init__(reason)
+        self.status = dict(status or {})
+
+
 @dataclass
 class Observation:
     images: dict[str, np.ndarray]
@@ -74,6 +81,10 @@ class Embodiment(Protocol):
     stop is callable from a separate operator thread. All other hardware calls
     are serialized on the session worker. home is cancellable and bounded.
     connect opens sensors/control but never homes or calibrates the gripper.
+    Optional recover(cancel) verifies fresh healthy state and acknowledged stop,
+    returning {"healthy": True, "stop_confirmed": True, ...}. It never unlocks,
+    powers on, releases brakes, homes, activates the gripper or arms motion.
+    Only RobotRecoveryRequired faults enable this explicit recovery path.
     """
     metadata: dict
     def connect(self) -> None: ...

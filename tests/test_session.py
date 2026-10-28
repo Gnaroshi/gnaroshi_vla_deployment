@@ -21,6 +21,15 @@ def ur5e_config(**overrides):
     return UR5eConfig(**values)
 
 
+class HealthyRobot:
+    def isConnected(self): return True
+    def isProgramRunning(self): return True
+    def getSafetyMode(self): return 1
+    def getRobotMode(self): return 7
+    def isProtectiveStopped(self): return False
+    def isEmergencyStopped(self): return False
+
+
 class Sessions(unittest.TestCase):
     def setUp(self):
         self.temporary=tempfile.TemporaryDirectory()
@@ -329,9 +338,10 @@ class HardwareContract(unittest.TestCase):
                 pass
             def enable_stream(self,*args):
                 pass
-        class Device:
-            def __init__(self,host):
-                pass
+        class Device(HealthyRobot):
+            FLAG_NO_WAIT=16
+            def __init__(self,host,frequency=-1.0,*,flags=1):
+                self.frequency,self.flags=frequency,flags
             def servoStop(self):
                 return True
             def disconnect(self):
@@ -359,6 +369,8 @@ class HardwareContract(unittest.TestCase):
             env.connect()
             self.assertEqual(env.gripper.activation_calls,0)
             self.assertEqual(env.metadata["gripper_status_at_connect"],0)
+            self.assertEqual((env.control.frequency,env.control.flags),(-1.0,16))
+            self.assertEqual(env.control.flags&1,0)
             env.close()
 
     def test_cancelled_gripper_activation_never_sends_activation_register(self):
@@ -375,7 +387,7 @@ class HardwareContract(unittest.TestCase):
 
     def test_false_servo_stop_ack_is_not_reported_as_success(self):
         env=UR5eEmbodiment(ur5e_config())
-        class Control:
+        class Control(HealthyRobot):
             def servoStop(self):
                 return False
         env.control=Control()
@@ -412,7 +424,7 @@ class HardwareContract(unittest.TestCase):
                 return Rotation()
             def as_rotvec(self):
                 return np.zeros(3)
-        class Control:
+        class Control(HealthyRobot):
             def getInverseKinematics(self,tcp,current):
                 return [0.0]*6
             def initPeriod(self):
@@ -421,7 +433,7 @@ class HardwareContract(unittest.TestCase):
                 pass
             def servoJ(self,*args):
                 return True
-        class Receive:
+        class Receive(HealthyRobot):
             def getActualQ(self):
                 return [0.0]*6
         class Gripper:

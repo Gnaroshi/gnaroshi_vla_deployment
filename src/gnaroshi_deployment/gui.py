@@ -98,17 +98,21 @@ class DeploymentGUI:
         controls.grid(row=0, sticky="ew")
         controls.columnconfigure(0, weight=1)
         controls.columnconfigure(1, weight=1)
-        self.start_button = ttk.Button(controls, text="Start [N] · home first", style="Accent.TButton", command=self.start)
+        self.start_button = ttk.Button(controls, text="Start [N] · home first", style="Accent.TButton", command=self.start, state="disabled")
         self.start_button.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0,6))
-        self.stop_button = ttk.Button(controls, text="Stop & discard [X]", style="Stop.TButton", command=lambda:self.signal("stop"))
+        self.stop_button = ttk.Button(controls, text="Stop & discard [X]", style="Stop.TButton", command=lambda:self.signal("stop"), state="disabled")
         self.stop_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0,6))
-        self.success_button = ttk.Button(controls, text="Success [S]", command=lambda:self.signal("success"))
+        self.success_button = ttk.Button(controls, text="Success [S]", command=lambda:self.signal("success"), state="disabled")
         self.success_button.grid(row=2, column=0, sticky="ew", padx=(0,3))
-        self.failure_button = ttk.Button(controls, text="Failure [F]", command=lambda:self.signal("failure"))
+        self.failure_button = ttk.Button(controls, text="Failure [F]", command=lambda:self.signal("failure"), state="disabled")
         self.failure_button.grid(row=2, column=1, sticky="ew", padx=(3,0))
-        self.retry_button = ttk.Button(controls, text="Stop for retry [R]", command=lambda:self.signal("retry"))
+        self.retry_button = ttk.Button(controls, text="Stop for retry [R]", command=lambda:self.signal("retry"), state="disabled")
         self.retry_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6,0))
-        ttk.Label(controls, text="Success / Failure: save then return home\nStop / Retry: discard and remain stationary", font=("DejaVu Sans", 9)).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8,0))
+        self.recover_button = ttk.Button(controls, text="Recover robot", command=self.recover_robot, state="disabled")
+        self.recover_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6,0))
+        self.recover_button.grid_remove()
+        self.control_hint = ttk.Label(controls, text="Success / Failure: save then return home\nStop / Retry: discard and remain stationary", font=("DejaVu Sans", 9))
+        self.control_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8,0))
         settings = ttk.LabelFrame(side, text="Runtime · change while ready", padding=10)
         settings.grid(row=1, sticky="ew", pady=10)
         self.hz = tk.StringVar(value=str(session.config.target_hz))
@@ -119,7 +123,7 @@ class DeploymentGUI:
         self.hz_entry.grid(row=0,column=1,padx=8)
         self.steps_entry = ttk.Entry(settings, textvariable=self.steps, width=12)
         self.steps_entry.grid(row=1,column=1,padx=8)
-        self.apply_button = ttk.Button(settings, text="Apply", command=self.apply_settings)
+        self.apply_button = ttk.Button(settings, text="Apply", command=self.apply_settings, state="disabled")
         self.apply_button.grid(row=0,column=2,rowspan=2)
         metrics = ttk.LabelFrame(side, text="Measured rollout", padding=10)
         metrics.grid(row=2,sticky="ew")
@@ -147,7 +151,7 @@ class DeploymentGUI:
         records = ttk.Frame(side)
         records.grid(row=5,sticky="ew",pady=(10,0))
         ttk.Button(records,text="Save [W]",command=self.save).pack(side="left")
-        self.delete_button = ttk.Button(records,text="Delete last [D]",command=self.delete)
+        self.delete_button = ttk.Button(records,text="Delete last [D]",command=self.delete,state="disabled")
         self.delete_button.pack(side="left",padx=6)
         ttk.Label(root,textvariable=self.status,wraplength=1350,padding=(18,6)).grid(row=2,sticky="ew")
         self.folder_label = ttk.Label(root,text=str(session.folder),padding=(18,0,18,12),font=("DejaVu Sans",9))
@@ -180,7 +184,7 @@ class DeploymentGUI:
                 button = ttk.Button(panel, text="Browse", command=lambda field=field:self.browse_checkpoint(field))
                 button.grid(row=row, column=2, padx=(6, 0))
                 self.reload_widgets.append((button, "normal"))
-        self.load_button = ttk.Button(panel, text="Load checkpoint", command=self.load_checkpoint)
+        self.load_button = ttk.Button(panel, text="Load checkpoint", command=self.load_checkpoint, state="disabled")
         self.load_button.grid(row=0, column=3, rowspan=max(1, len(self.reload_fields)), padx=(10, 0), sticky="ns")
         files = ttk.Frame(panel)
         files.grid(row=len(self.reload_fields), column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -520,6 +524,14 @@ class DeploymentGUI:
         if self.session.signal(action):
             self.status.set(f"{action.title()} requested; cancelling pending policy action")
 
+    def recover_robot(self):
+        if self.closing or self._reload_in_progress:
+            return False
+        if self.session.recover_robot():
+            self.status.set("Checking robot health and stop acknowledgement; no home or motion requested")
+            return True
+        return False
+
     def apply_settings(self):
         try:
             if self.closing or self._reload_in_progress:
@@ -581,10 +593,21 @@ class DeploymentGUI:
             self._show_load_error(self.session.error, getattr(self.session, "error_detail", None))
         self.state.set("LOADING" if self._reload_in_progress and not self.closing else state)
         ready=state=="READY" and not self.closing and not self._reload_in_progress
-        active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING"}
+        recovery=state in {"RECOVERY_REQUIRED", "RECOVERING"} or self.session._recovery_fault
+        active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING", "RECOVERY_REQUIRED", "RECOVERING"}
         self.start_button.configure(state="normal" if ready else "disabled")
         for button in (self.stop_button,self.retry_button):
             button.configure(state="normal" if active else "disabled")
+        if recovery:
+            self.retry_button.grid_remove()
+            self.recover_button.grid()
+        else:
+            self.recover_button.grid_remove()
+            self.retry_button.grid()
+        self.recover_button.configure(text="Checking robot..." if state == "RECOVERING" else "Recover robot",
+                                      state="normal" if self.session.can_recover and not self.closing else "disabled")
+        self.control_hint.configure(text="Release fault on teach pendant, then Recover robot\nRecovery stays stationary; Start is separate" if recovery else
+                                    "Success / Failure: save then return home\nStop / Retry: discard and remain stationary")
         for button in (self.success_button,self.failure_button):
             button.configure(state="normal" if state in {"RUNNING","WAITING_OUTCOME"} else "disabled")
         for widget in (self.apply_button,self.hz_entry,self.steps_entry):

@@ -14,10 +14,19 @@ from gnaroshi_deployment.contracts import SessionConfig
 from gnaroshi_deployment.session import DeploymentSession
 
 
+class HealthyStatus:
+    def isConnected(self): return True
+    def isProgramRunning(self): return True
+    def getSafetyMode(self): return 1
+    def getRobotMode(self): return 7
+    def isProtectiveStopped(self): return False
+    def isEmergencyStopped(self): return False
+
+
 class ControlConnectionCancellation(unittest.TestCase):
     def test_close_rechecks_stop_after_control_is_assigned(self):
         entered, release = threading.Event(), threading.Event()
-        class Control:
+        class Control(HealthyStatus):
             disconnected = False
             def servoStop(self):
                 return False
@@ -254,11 +263,14 @@ class CameraOnlyAdapter(unittest.TestCase):
         class Config:
             def enable_device(self, serial): pass
             def enable_stream(self, *args): pass
-        class Control:
-            def __init__(self, host): controls.append(self)
+        class Control(HealthyStatus):
+            FLAG_NO_WAIT=16
+            def __init__(self, host, frequency=-1.0, *, flags=1):
+                self.frequency,self.flags=frequency,flags
+                controls.append(self)
             def servoStop(self): return True
             def disconnect(self): pass
-        class Receive:
+        class Receive(HealthyStatus):
             def __init__(self, host): receivers.append(self)
             def disconnect(self): pass
         class Gripper:
@@ -284,6 +296,8 @@ class CameraOnlyAdapter(unittest.TestCase):
             environment.connect()
             self.assertEqual(len(pipelines), 2)
             self.assertEqual((len(controls), len(receivers), len(grippers)), (1, 1, 1))
+            self.assertEqual((controls[0].frequency,controls[0].flags),(-1.0,16))
+            self.assertEqual(controls[0].flags&1,0)
             environment.close()
         self.assertEqual([camera.started for camera in pipelines], [1, 1])
         self.assertEqual([camera.stopped for camera in pipelines], [1, 1])
