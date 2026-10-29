@@ -702,6 +702,11 @@ class DeploymentSession:
         with self.lock:
             if self.state != "READY":
                 return False
+            if enabled:
+                try:
+                    import cv2
+                except (ImportError, OSError) as error:
+                    raise RuntimeError("Video recording requires a working OpenCV installation") from error
             self.config.record_video = enabled
             self._recording_status.update(enabled=enabled)
             selection = self.config.metadata.get("reload_selection", {})

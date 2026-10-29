@@ -1,5 +1,6 @@
 """Operator device changes and recording recovery without real hardware."""
 import hashlib
+import builtins
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -245,6 +246,20 @@ class OperatorSessions(unittest.TestCase):
         self.assertEqual(saved["outcome"], "success")
         self.assertEqual(saved["operator_note"], "Contact was delayed")
         self.assertFalse(session.annotate_result(9999, "Unknown attempt"))
+
+    def test_recording_dependency_failure_is_reported_before_changing_config_or_moving(self):
+        session = self.make()
+        actual_import = builtins.__import__
+        def missing_cv2(name, *args, **kwargs):
+            if name == "cv2":
+                raise ImportError("Test: video dependency is unavailable")
+            return actual_import(name, *args, **kwargs)
+        with patch("builtins.__import__", side_effect=missing_cv2):
+            with self.assertRaisesRegex(RuntimeError, "OpenCV"):
+                session.apply_recording(True)
+        self.assertFalse(session.config.record_video)
+        self.assertEqual(session.embodiment.home_count, 0)
+        self.assertEqual(session.embodiment.applied, [])
 
 
 class RecordingMetrics(unittest.TestCase):
