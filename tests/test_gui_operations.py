@@ -8,6 +8,7 @@ import time
 from types import SimpleNamespace
 import tkinter as tk
 from tkinter import ttk
+from tkinter import font as tkfont
 import unittest
 from unittest.mock import patch
 
@@ -62,6 +63,7 @@ class GUIOperations(unittest.TestCase):
     def test_home_button_queues_pose_only_move_without_a_rollout(self):
         session = self.launch()
         self.app.refresh()
+        self.assertNotIn("Loading",self.app.status.get())
         self.assertEqual(str(self.app.home_button.cget("state")), "normal")
         self.app.home_button.invoke()
         self.assertEqual(session.state, "HOMING")
@@ -154,6 +156,73 @@ class GUIOperations(unittest.TestCase):
         saved = (session.folder / "notes.txt").read_text()
         self.assertIn("Operator note remains editable", saved)
         self.assertIn("protective_stop", saved)
+
+    def test_saved_session_scoreboard_excludes_idle_faults_and_preserves_manual_success(self):
+        session = self.launch()
+        session.results[:] = [
+            {"outcome":"success", "failure_category":"protective_stop", "outcome_source":"manual"},
+            {"outcome":"success", "outcome_source":"manual"},
+            {"outcome":"failure", "outcome_source":None},
+            {"outcome":"failure", "outcome_source":"automatic_fault"},
+            {"outcome":"discarded", "outcome_source":"automatic_fault"},
+        ]
+        self.app._update_scoreboard(session.results)
+        self.assertEqual({key:value.get() for key,value in self.app.score_vars.items()},
+                         {"success":"2", "failure":"2", "rate":"50.0%", "total":"4"})
+        self.assertEqual(self.app.automatic_count.get(), "Automatic failures: 1")
+        self.assertEqual(self.app.score_scope.get(), "Saved in this session")
+        session.results.clear()
+        self.app._update_scoreboard([])
+        self.assertEqual(self.app.score_vars["rate"].get(), "—")
+
+    def test_semantic_fonts_and_operator_zoom_change_actual_rendered_text(self):
+        self.launch()
+        score_font = tkfont.Font(root=self.root, font=self.app.style.lookup("Success.Score.TLabel", "font"))
+        self.assertEqual(score_font.actual("size"), 32)
+        self.assertEqual(score_font.actual("weight"), "bold")
+        self.assertEqual(self.app.fonts["body"].actual("size"), 14)
+        self.app.set_text_size(21)
+        self.root.update()
+        note_font = tkfont.Font(root=self.root, font=self.app.notes.cget("font"))
+        self.assertEqual(note_font.actual("size"), 21)
+        self.assertEqual(self.app.fonts["score"].actual("size"), 48)
+        self.assertGreaterEqual(self.app.style.lookup("Treeview", "rowheight"), note_font.metrics("linespace")+10)
+        self.assertEqual(self.app.preferences.get("text_size"), 21)
+        self.assertGreaterEqual(self.app.table.column("result","width"),self.app.fonts["body"].measure("success")+16)
+
+    def test_close_cancels_pending_presentation_save_timer(self):
+        self.launch()
+        self.app._schedule_preferences()
+        pending = self.app._preferences_job
+        self.assertIsNotNone(pending)
+        self.app.close()
+        self.assertNotIn(pending,self.root.tk.call("after","info"))
+        self.assertIsNone(self.app._preferences_job)
+
+    def test_primary_counts_and_actions_fit_small_window_with_large_text(self):
+        self.launch()
+        self.root.deiconify()
+        self.root.geometry("960x640+0+0")
+        self.app.set_text_size(21)
+        self.root.update()
+        self.app._layout_workspace()
+        self.root.update()
+        self.assertGreaterEqual(self.app.workspace_canvas.winfo_height(),180)
+        for widget in (*self.app.run_buttons, *self.app.score_labels.values(),self.app.automatic_count_label,self.app.state_label,
+                       self.app.exit_button, self.app.larger_text_button):
+            x, y = widget.winfo_rootx()-self.root.winfo_rootx(), widget.winfo_rooty()-self.root.winfo_rooty()
+            self.assertGreaterEqual(x, 0, str(widget))
+            self.assertGreaterEqual(y, 0, str(widget))
+            self.assertLessEqual(x+widget.winfo_width(), self.root.winfo_width(), str(widget))
+            self.assertLessEqual(y+widget.winfo_height(), self.root.winfo_height(), str(widget))
+        self.assertLessEqual(self.app.scoreboard.winfo_reqwidth(),self.root.winfo_width())
+        if self.app.view_picker.winfo_viewable():
+            self.app.view_picker.current(4)
+            self.app.view_picker.event_generate("<<ComboboxSelected>>")
+        else:
+            self.app.tabs.select(4)
+        self.root.update()
+        self.assertEqual(self.app.tabs.tab(self.app.tabs.select(), "text"), "Details")
 
     def test_primary_view_hides_technical_paths_and_theme_has_readable_contrast(self):
         session = self.launch()
@@ -312,6 +381,12 @@ class GUIOperations(unittest.TestCase):
         self.assertGreater(self.app.camera_labels[0].winfo_height(), 80)
         self.assertTrue(self.app.load_button.winfo_viewable())
         self.assertEqual(str(self.app.reload_widgets[0][0].cget("state")), "readonly")
+        last_field = self.app.reload_widgets[-1][0]
+        last_field.focus_force()
+        self.root.update()
+        form_canvas = self.app._selection_form.scroll_canvas
+        self.assertGreaterEqual(last_field.winfo_rooty(),form_canvas.winfo_rooty())
+        self.assertLessEqual(last_field.winfo_rooty()+last_field.winfo_height(),form_canvas.winfo_rooty()+form_canvas.winfo_height())
         self.app.tabs.select(self.app.devices_tab)
         self.root.update()
         canvas = next(widget for widget in self.app.devices_tab.winfo_children() if isinstance(widget, tk.Canvas))
@@ -320,6 +395,32 @@ class GUIOperations(unittest.TestCase):
         button = self.app.reconnect_cameras_button
         self.assertGreaterEqual(button.winfo_rooty(), canvas.winfo_rooty())
         self.assertLess(button.winfo_rooty()+button.winfo_height(), canvas.winfo_rooty()+canvas.winfo_height()+1)
+
+    def test_large_selection_header_and_full_draft_choice_remain_readable(self):
+        long_task = "A task with a deliberately long name · 한글 작업 이름도 끝까지 확인"
+        fields = [{"key":"task","label":"Task","kind":"choice","choices":[long_task],"value":long_task}]
+        fields += [{"key":f"setting_{number}","label":f"Setting {number}","value":"draft","advanced":number>8}
+                   for number in range(1,17)]
+        self.launch(selecting=True,reload_fields=fields,reload_factory=lambda *_args:None)
+        self.root.geometry("960x640+0+0")
+        self.root.deiconify()
+        self.app.set_text_size(21)
+        self.root.update()
+        for button in (self.app.checkpoint_toggle,self.app.help_button,self.app.exit_button,self.app.larger_text_button):
+            self.assertGreaterEqual(button.winfo_width(),button.winfo_reqwidth())
+            self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),self.root.winfo_rootx()+self.root.winfo_width())
+        choice,variable,hint = self.app._selection_choice_hints[0]
+        self.assertEqual(variable.get(),long_task)
+        self.assertTrue(hint.winfo_viewable())
+        self.assertGreater(hint.winfo_height(),self.app.fonts["caption"].metrics("linespace"))
+        self.assertGreater(float(self.app.workspace_canvas.cget("scrollregion").split()[3]),self.app.workspace_canvas.winfo_height())
+        self.assertTrue(self.app.load_button.winfo_viewable())
+        self.assertGreaterEqual(self.app.workspace_canvas.winfo_height(),180)
+        self.assertTrue(self.app.context_button.winfo_viewable())
+        self.assertFalse(self.app.identity_label.winfo_viewable())
+        self.app.context_button.invoke()
+        self.root.update()
+        self.assertTrue(self.app.identity_label.winfo_viewable())
 
     def test_recording_checkbox_changes_only_ready_configuration_without_moving_robot(self):
         session = self.launch()

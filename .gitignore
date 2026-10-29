@@ -8,6 +8,8 @@ __pycache__/
 .pytest_cache/
 .env
 .env.*
+ui_preferences.json
+.ui_preferences.json
 *.log
 *.mp4
 *.pt

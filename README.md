@@ -103,11 +103,45 @@ Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5
 
 ### 화면과 실패 원인
 
-화면은 [gnaroshi_mds UI/UX 지침](https://github.com/Gnaroshi/gnaroshi_mds/blob/a4c6150b2feac1f03bd8cb7b7fa5c29769016e71/guides/ui-ux.md)의
-작업용 dark palette와 native control을 사용한다. 상태와 다음 조작, 카메라, 실행 결과를 먼저
+화면은 [gnaroshi_mds UI/UX 지침](https://github.com/Gnaroshi/gnaroshi_mds/blob/main/guides/ui-ux.md)의
+작업용 dark palette, native control, semantic typography와 크기 조절 workspace를 따른다. 상태와 다음 조작, 카메라, 실행 결과를 먼저
 보여주고 경로·원시 오류·checkpoint identity는 Details에서 확인한다. 색상과 함께 상태 문구를
 표시한다. 자동 실패 원인은 rollout 목록과 읽기 전용 자동 notes에 남고 사용자가 작성한 notes와
 별도로 저장한다. 사용자가 편집한 notes를 자동 메시지로 덮어쓰지 않는다.
+
+### 집계·글자·작업 영역
+
+로봇을 반복 평가하는 operator가 현재 상태와 다음 조작, 저장된 결과를 바로 읽도록 구성한다.
+상단의 **Success / Failure / Success rate / Total**은 현재 session에서 저장·확정한 rollout만
+집계한다. 자동 fault의 Failure도 포함하며 Stop/Retry로 폐기한 attempt와 idle 오류는 제외한다.
+Success 이후 복귀 Home 오류는 이미 확정된 outcome을 바꾸지 않는다. 0개일 때 성공률은
+분모가 없으므로 `—`다. 다른 checkpoint를 Load하면 새 session의 집계를 보여주며 이전 결과는 보존한다.
+
+집계와 실행 조작은 스크롤 영역 밖에 유지한다. 카메라·참고 장면·결과/설정·notes의 경계는
+직접 끌어서 조절한다. 구분선에 Tab으로 focus를 주고 Arrow / Shift+Arrow로 크기를 바꾸거나
+Home/End로 범위 끝, Enter 또는 더블클릭으로 기본 비율을 복원한다. 지원하는 pane은 숨김·펼침이
+가능하며 다시 펼치는 조작은 접근 가능한 위치에 남는다. 좁은 창에서의 clamp는 넓은 창에 저장한
+선호 비율을 지우지 않는다.
+
+상단 A- / A+와 Settings의 글자 설정으로 읽기 크기를 조절한다. Ctrl+plus/minus로 확대·축소하고
+Ctrl+0으로 기본값을 복원한다. 제목·본문·보조문구·수치는 named semantic font를 사용하며,
+행 높이·control padding·줄바꿈·열 배치도 함께 바뀐다. EN/KO가 필요하면 OS에 해당 glyph를 가진
+글꼴이 있어야 한다. semantic token의 원본은 gui.py의 THEME/SPACE와 font 역할이고, pane 동작과
+local presentation persistence는 workspace.py에서 관리한다.
+큰 글자로 낮은 창을 사용할 때는 긴 instruction과 policy 설명을 **Context**에서 펼쳐 볼 수 있다.
+집계는 같은 줄의 큰 숫자로 압축하고 실행 조작은 유지해 카메라와 결과 작업 영역을 확보한다.
+**Save notes [W]**는 Notes에, 확인 후 삭제하는 **Delete last [D]**는 Rollouts에 둔다.
+설정 입력칸으로 Tab 이동하면 중첩된 스크롤 영역도 해당 입력칸을 보이도록 따라간다.
+
+글자·창·pane 배치는 local UI preferences에 보관한다. 실험 결과와 checkpoint 설정을 바꾸지 않는다.
+caller는 DeploymentGUI의 optional preferences_path 또는 config.metadata의 ui_preferences_path로
+경로를 지정할 수 있다. config_directory가 있으면 그 부모의 ui_preferences.json을 사용하고,
+없으면 output_root 아래 ignored .ui_preferences.json을 사용한다. 설정 파일은 Git에 넣지 않는다.
+
+프로젝트는 config.metadata의 display_method/display_task로 읽기 쉬운 이름을 제공할 수 있다.
+로드한 policy.metadata의 display_method가 있으면 실제 모델 이름으로 우선한다. Canonical method와
+checkpoint identity는 원본 그대로 기록하며 경로·hash·원시 오류는 Details에서 확인한다.
+드물게 수정하는 설정은 reload field에 advanced=True를 지정해 Advanced settings에 넣는다.
 
 ### 같은 창에서 checkpoint 교체
 

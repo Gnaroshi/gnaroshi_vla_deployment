@@ -18,6 +18,7 @@ from PIL import Image, ImageTk
 from .reference import ReferenceCatalog
 from .records import summary, write_json
 from .session import DeploymentSession
+from .workspace import WorkspacePreferences, ResizablePane, clamp_window_geometry, geometry_string
 
 
 # Semantic working palette, following Gnaroshi MDS ui-ux guidance. Device and
@@ -33,13 +34,32 @@ SPACE = {"small": 4, "button_y": 6, "control": 8, "group": 12, "section": 16}
 
 class DeploymentGUI:
     def __init__(self, root, session, *, reload_fields=None, reload_factory=None,
-                 selection_resolver=None, config_loader=None, config_saver=None, config_directory=None):
+                 selection_resolver=None, config_loader=None, config_saver=None, config_directory=None,
+                 preferences_path=None):
         self.root, self.session = root, session
         self.reload_fields = tuple(reload_fields or ())
         self.reload_factory = reload_factory
         self.selection_resolver = selection_resolver
         self.config_loader, self.config_saver = config_loader, config_saver
         self.config_directory = Path(config_directory).expanduser() if config_directory is not None else None
+        preference_file = preferences_path or session.config.metadata.get("ui_preferences_path")
+        if preference_file is None:
+            preference_file = (self.config_directory.parent/"ui_preferences.json" if self.config_directory is not None
+                               else Path(session.config.output_root)/".ui_preferences.json")
+        self.preferences = WorkspacePreferences(Path(preference_file))
+        self.text_size = max(12, min(24, int(self.preferences.get("text_size", 14))))
+        self._workspace_panes = []
+        self._layout_job = None
+        self._preferences_job = None
+        self._preferences_changed = False
+        self._selection_cells = []
+        self._selection_choice_hints = []
+        self._scroll_regions = []
+        self._last_displayed_state = None
+        self._measurement_layout_seen = None
+        self._compact_chrome = False
+        self._short_context_open = False
+        self._advanced_fields_open = False
         self._selection_context = copy.deepcopy(session.config.metadata.get("reload_selection", {}))
         self._load_error_session = None
         if bool(self.reload_fields) != bool(reload_factory):
@@ -74,8 +94,11 @@ class DeploymentGUI:
         self._camera_actual_seen = self._camera_mapping()
         self.camera_title_vars = {}
         root.title(f"{session.config.method} | {session.config.task} deployment")
-        root.geometry("1440x960")
-        root.minsize(1100, 780)
+        restored_window = clamp_window_geometry(self.preferences.get("window", {"width":1440,"height":960}),
+                                               root.winfo_screenwidth(), root.winfo_screenheight(),
+                                               min_width=960, min_height=640)
+        root.geometry(geometry_string(restored_window))
+        root.minsize(min(960, root.winfo_screenwidth()), min(640, root.winfo_screenheight()))
         self._configure_theme()
         self.state = tk.StringVar(value="CONNECTING")
         self.status = tk.StringVar(value="Preparing deployment")
@@ -83,70 +106,108 @@ class DeploymentGUI:
         self.counts = tk.StringVar(value="No saved rollouts")
         self.failure_note = tk.StringVar(value="Select a saved rollout to view its result.")
         root.columnconfigure(0, weight=1)
-        root.rowconfigure(1, weight=1)
-        heading = ttk.Frame(root, padding=(SPACE["section"], SPACE["control"]))
+        root.rowconfigure(3, weight=1)
+        heading = self.heading = ttk.Frame(root, padding=(SPACE["section"], SPACE["control"]))
         heading.grid(row=0, sticky="ew")
         heading.columnconfigure(0, weight=1)
-        self.heading_label = ttk.Label(heading, text=f"{session.config.task.title()}  /  {session.config.method}", style="Heading.TLabel")
+        self.header_tools = ttk.Frame(heading)
+        self.heading_label = ttk.Label(heading, text=self._display_task(), style="Heading.TLabel")
         self.heading_label.grid(row=0, column=0, sticky="w")
         self.state_label = ttk.Label(heading, textvariable=self.state, style="State.TLabel", padding=(12, 8))
         self.state_label.grid(row=0, column=1, padx=SPACE["group"])
         if self.reload_fields:
-            self.checkpoint_toggle = ttk.Button(heading, text="Task / checkpoint...", command=self.toggle_checkpoint_panel)
+            self.checkpoint_toggle = ttk.Button(heading, text="Task / checkpoint...", width=0, command=self.toggle_checkpoint_panel)
             self.checkpoint_toggle.grid(row=0, column=2, padx=(0, SPACE["control"]))
-        self.help_button = ttk.Button(heading, text="Help [F1]", command=self.show_help)
+        self.help_button = ttk.Button(heading, text="Help [F1]", width=0, command=self.show_help)
         self.help_button.grid(row=0, column=3 if self.reload_fields else 2, padx=(0, SPACE["control"]))
-        self.exit_button = ttk.Button(heading, text="Exit", command=self.close)
-        self.exit_button.grid(row=0, column=4 if self.reload_fields else 3)
+        self.context_button = ttk.Button(heading,text="Context",width=0,command=self.toggle_context)
+        self.zoom_controls = ttk.Frame(heading)
+        self.zoom_controls.grid(row=0, column=4 if self.reload_fields else 3, padx=(0, SPACE["control"]))
+        self.smaller_text_button = ttk.Button(self.zoom_controls, text="A-", width=3, command=lambda:self.change_text_size(-1))
+        self.smaller_text_button.pack(side="left")
+        self.text_size_label = ttk.Label(self.zoom_controls, text=f"{self.text_size} pt", style="Caption.TLabel", width=5, anchor="center")
+        self.text_size_label.pack(side="left", padx=SPACE["small"])
+        self.larger_text_button = ttk.Button(self.zoom_controls, text="A+", width=3, command=lambda:self.change_text_size(1))
+        self.larger_text_button.pack(side="left")
+        self.exit_button = ttk.Button(heading, text="Exit", width=0, command=self.close)
+        self.exit_button.grid(row=0, column=5 if self.reload_fields else 4)
         self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1000, style="Muted.TLabel")
-        self.instruction_label.grid(row=1, column=0, columnspan=5 if self.reload_fields else 4, sticky="w", pady=(SPACE["control"], 0))
+        self.instruction_label.grid(row=1, column=0, columnspan=6 if self.reload_fields else 5, sticky="w", pady=(SPACE["small"], 0))
         self.active_identity = tk.StringVar(value="Waiting for the selected policy")
-        ttk.Label(heading, textvariable=self.active_identity, style="Muted.TLabel", wraplength=1100).grid(
-            row=2, column=0, columnspan=5 if self.reload_fields else 4, sticky="w", pady=(SPACE["small"], 0))
+        self.identity_label = ttk.Label(heading, textvariable=self.active_identity, style="Caption.TLabel", wraplength=1100)
+        self.identity_label.grid(row=2, column=0, columnspan=6 if self.reload_fields else 5, sticky="w", pady=(SPACE["small"], 0))
+        self._scoreboard(root)
+        controls = self.controls = ttk.Frame(root, padding=(SPACE["section"], SPACE["small"]))
+        controls.grid(row=2, sticky="ew")
+        for column in range(7):
+            controls.columnconfigure(column, weight=1, uniform="run_actions")
         body = ttk.Frame(root, padding=(SPACE["section"], 0, SPACE["section"], SPACE["control"]))
-        body.grid(row=1, sticky="nsew")
+        body.grid(row=3, sticky="nsew")
         body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=0, minsize=400)
         body.rowconfigure(0, weight=1)
-        main = ttk.Frame(body)
-        main.grid(row=0, column=0, sticky="nsew", padx=(0, SPACE["section"]))
+        self.workspace_canvas = tk.Canvas(body, background=THEME["canvas"], highlightthickness=0, width=1, height=1)
+        self.workspace_canvas.grid(row=0,column=0,sticky="nsew")
+        self.workspace_scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.workspace_canvas.yview)
+        self.workspace_scrollbar.grid(row=0,column=1,sticky="ns")
+        self.workspace_canvas.configure(yscrollcommand=self.workspace_scrollbar.set)
+        self.workspace_content = ttk.Frame(self.workspace_canvas)
+        self.workspace_content.columnconfigure(0,weight=1)
+        self.workspace_content.rowconfigure(0,weight=1)
+        self._workspace_window = self.workspace_canvas.create_window(0,0,anchor="nw",window=self.workspace_content)
+        self.workspace_canvas.bind("<Configure>",self._workspace_resized)
+        root.bind("<FocusIn>",lambda event:self._reveal_focus(event,self.workspace_canvas,self.workspace_content),add="+")
+        self.main_pane = self._pane(self.workspace_content, key="main", orient="horizontal", first_label="Cameras", second_label="Results",
+                                    first_min=360, second_min=420, default_fraction=.62, collapsible=(False, True))
+        self.main_pane.grid(row=0, column=0, sticky="nsew")
+        main = self.main_pane.first
         main.columnconfigure(0, weight=1)
-        main.rowconfigure(1, weight=2)
-        main.rowconfigure(2, weight=1)
+        main.rowconfigure(1, weight=1)
         if self.reload_fields:
             self._checkpoint_panel(main)
-        self.camera_labels = self._image_pair(main, "Live observations", row=1)
-        self._references(main)
-        side = ttk.Frame(body)
-        side.grid(row=0, column=1, sticky="nsew")
+        self.visual_pane = self._pane(main, key="live_reference", orient="vertical", first_label="Live cameras", second_label="Start reference",
+                                      first_min=180, second_min=120, default_fraction=.72, show_header=False,
+                                      collapsible=(False, True))
+        self.visual_pane.grid(row=1, column=0, sticky="nsew")
+        for container in (self.visual_pane.first, self.visual_pane.second):
+            container.columnconfigure(0, weight=1)
+            container.rowconfigure(0, weight=1)
+        self.camera_labels = self._image_pair(self.visual_pane.first, "Live observations", row=0)
+        self._references(self.visual_pane.second)
+        side = self.main_pane.second
         side.columnconfigure(0, weight=1)
-        side.rowconfigure(3, weight=1)
-        controls = ttk.LabelFrame(side, text="Run control", padding=SPACE["control"])
-        controls.grid(row=0, sticky="ew")
-        controls.columnconfigure(0, weight=1, uniform="control")
-        controls.columnconfigure(1, weight=1, uniform="control")
-        self.start_button = ttk.Button(controls, text="Start rollout [N]", style="Accent.TButton", command=self.start, state="disabled")
-        self.start_button.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, SPACE["control"]))
+        side.rowconfigure(0, weight=1)
+        self.inspector_pane = self._pane(side, key="inspector", orient="vertical", first_label="Live measurements", second_label="Saved results and settings",
+                                         first_min=70, second_min=150, default_fraction=.24, show_header=False,
+                                         collapsible=(True, False))
+        self.inspector_pane.grid(row=0, column=0, sticky="nsew")
+        self._inspector_width = None
+        self.main_pane.second.bind("<Configure>", self._inspector_resized, add="+")
+        self.start_button = ttk.Button(controls, text="Start [N]", style="Accent.TButton", command=self.start, state="disabled")
         self.success_button = ttk.Button(controls, text="Success [S]", command=lambda:self.signal("success"), state="disabled")
-        self.success_button.grid(row=1, column=0, sticky="ew", padx=(0, SPACE["small"]))
         self.failure_button = ttk.Button(controls, text="Failure [F]", command=lambda:self.signal("failure"), state="disabled")
-        self.failure_button.grid(row=1, column=1, sticky="ew", padx=(SPACE["small"], 0))
-        self.stop_button = ttk.Button(controls, text="Stop / discard [X]", style="Stop.TButton", command=lambda:self.signal("stop"), state="disabled")
-        self.stop_button.grid(row=2, column=0, sticky="ew", padx=(0, SPACE["small"]), pady=(SPACE["control"], 0))
-        self.retry_button = ttk.Button(controls, text="Stop for retry [R]", command=lambda:self.signal("retry"), state="disabled")
-        self.retry_button.grid(row=2, column=1, sticky="ew", padx=(SPACE["small"], 0), pady=(SPACE["control"], 0))
+        self.stop_button = ttk.Button(controls, text="Stop [X]", style="Stop.TButton", command=lambda:self.signal("stop"), state="disabled")
+        self.retry_button = ttk.Button(controls, text="Retry [R]", command=lambda:self.signal("retry"), state="disabled")
         self.home_button = ttk.Button(controls, text="Home [H]", command=self.home_robot, state="disabled")
-        self.home_button.grid(row=3, column=0, sticky="ew", padx=(0, SPACE["small"]), pady=(SPACE["control"], 0))
         self.recover_button = ttk.Button(controls, text="Recover robot", command=self.recover_robot, state="disabled")
-        self.recover_button.grid(row=3, column=1, sticky="ew", padx=(SPACE["small"], 0), pady=(SPACE["control"], 0))
-        self.control_hint = ttk.Label(controls, text="Start: home, then a fresh rollout.\n" + self._home_description(), style="Muted.TLabel", wraplength=370)
-        self.control_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(SPACE["control"], 0))
-        metrics = ttk.LabelFrame(side, text="Measurements", padding=SPACE["control"])
-        metrics.grid(row=1, sticky="ew", pady=SPACE["group"])
-        ttk.Label(metrics, textvariable=self.metrics, justify="left").pack(anchor="w")
-        ttk.Label(side, textvariable=self.counts, wraplength=390, style="Muted.TLabel").grid(row=2, sticky="ew", pady=(0, SPACE["control"]))
-        tabs = self.tabs = ttk.Notebook(side)
-        tabs.grid(row=3, sticky="nsew")
+        self.run_buttons = (self.start_button, self.success_button, self.failure_button,
+                            self.stop_button, self.retry_button, self.home_button, self.recover_button)
+        self.control_hint = ttk.Label(self.inspector_pane.first, text="Start: home, then a fresh rollout.", style="Caption.TLabel", wraplength=420)
+        self.control_hint.pack(anchor="w", fill="x", padx=SPACE["control"], pady=(SPACE["small"], 0))
+        self.measurement_label = ttk.Label(self.inspector_pane.first, textvariable=self.metrics, justify="left", wraplength=420)
+        self.measurement_label.pack(anchor="w", fill="x", padx=SPACE["control"], pady=SPACE["small"])
+        self.inspector_pane.second.columnconfigure(0, weight=1)
+        self.inspector_pane.second.rowconfigure(1, weight=1)
+        self.view_selector = ttk.Frame(self.inspector_pane.second, padding=(SPACE["control"], SPACE["small"]))
+        self.view_selector.columnconfigure(1, weight=1)
+        ttk.Label(self.view_selector, text="View").grid(row=0, column=0, padx=(0,SPACE["control"]))
+        self.selected_view = tk.StringVar(value="Rollouts")
+        self.view_picker = ttk.Combobox(self.view_selector, textvariable=self.selected_view,
+                                       values=("Rollouts","Notes","Devices","Settings","Details"), state="readonly", width=12)
+        self.view_picker.grid(row=0, column=1, sticky="ew")
+        tabs = self.tabs = ttk.Notebook(self.inspector_pane.second)
+        tabs.grid(row=1, sticky="nsew")
+        self.view_picker.bind("<<ComboboxSelected>>", lambda _event:tabs.select(self.view_picker.current()))
+        tabs.bind("<<NotebookTabChanged>>", lambda _event:self.selected_view.set(tabs.tab(tabs.select(),"text")))
         frames, tab_frames = {}, {}
         for title in ("Rollouts", "Notes", "Devices", "Settings", "Details"):
             if title in {"Rollouts", "Devices", "Settings"}:
@@ -167,10 +228,13 @@ class DeploymentGUI:
         self.table.tag_configure("failure", foreground=THEME["danger"])
         self.table.tag_configure("success", foreground=THEME["accent"])
         self.table.grid(row=0, column=0, sticky="nsew")
+        self._size_result_columns()
         self.table.bind("<<TreeviewSelect>>", self.show_result_note)
-        ttk.Label(results, textvariable=self.failure_note, wraplength=370, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
+        self.failure_note_label = ttk.Label(results, textvariable=self.failure_note, wraplength=420, style="Caption.TLabel")
+        self.failure_note_label.grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
         self.result_summary = tk.StringVar(value="")
-        ttk.Label(results, textvariable=self.result_summary, wraplength=370, style="Muted.TLabel").grid(row=2, sticky="ew", pady=(SPACE["small"], 0))
+        self.result_summary_label = ttk.Label(results, textvariable=self.result_summary, wraplength=420, style="Caption.TLabel")
+        self.result_summary_label.grid(row=2, sticky="ew", pady=(SPACE["small"], 0))
         result_actions = ttk.Frame(results)
         result_actions.grid(row=3, sticky="ew", pady=(SPACE["control"], 0))
         self.open_result_button = ttk.Button(result_actions, text="Open folder", command=self.open_result_folder)
@@ -197,14 +261,14 @@ class DeploymentGUI:
         self._annotation_result_id = None
         self._devices_panel(devices)
         notes.columnconfigure(0, weight=1)
-        notes.rowconfigure(1, weight=1)
-        ttk.Label(notes, text="Experiment notes · saved automatically", style="Muted.TLabel").grid(row=0, sticky="w", pady=(0, SPACE["small"]))
-        self.notes = tk.Text(notes, wrap="word", width=24, height=4, **self._text_style())
-        self.notes.grid(row=1, sticky="nsew")
+        notes.rowconfigure(0, weight=1)
+        self.notes_pane = self._pane(notes, key="notes", orient="vertical", first_label="Experiment notes",
+                                     second_label="Automatic fault notes", first_min=90, second_min=70,
+                                     default_fraction=.65, collapsible=(False,True),show_header=False)
+        self.notes_pane.grid(row=0, column=0, sticky="nsew")
+        self.notes = self._text_area(self.notes_pane.first, height=4,title="Experiment notes")
         self.notes.bind("<KeyRelease>", self.schedule_notes)
-        ttk.Label(notes, text="Recorded failure notes", style="Muted.TLabel").grid(row=2, sticky="w", pady=(SPACE["control"], SPACE["small"]))
-        self.failure_notes = tk.Text(notes, wrap="word", width=24, height=4, **self._text_style())
-        self.failure_notes.grid(row=3, sticky="ew")
+        self.failure_notes = self._text_area(self.notes_pane.second, height=4,title="Automatic fault notes")
         self.failure_notes.configure(state="disabled")
         self.hz = tk.StringVar(value=str(session.config.target_hz))
         self.steps = tk.StringVar(value=str(session.config.max_steps))
@@ -221,30 +285,343 @@ class DeploymentGUI:
         self.record_video = tk.BooleanVar(value=session.config.record_video)
         self.record_video_toggle = ttk.Checkbutton(settings, text="Record rollout videos", variable=self.record_video)
         self.record_video_toggle.grid(row=3, column=0, columnspan=2, sticky="w", pady=(SPACE["control"], 0))
+        ttk.Separator(settings).grid(row=7, column=0, columnspan=2, sticky="ew", pady=SPACE["section"])
+        ttk.Label(settings, text="Text size").grid(row=8, column=0, sticky="w")
+        self.text_size_choice = tk.StringVar(value=str(self.text_size))
+        self.text_size_picker = ttk.Combobox(settings, textvariable=self.text_size_choice,
+                                             values=tuple(str(value) for value in range(12,25)), state="readonly", width=12)
+        self.text_size_picker.grid(row=8, column=1, sticky="ew", padx=(SPACE["control"], 0))
+        self.text_size_picker.bind("<<ComboboxSelected>>", lambda _event:self.set_text_size(self.text_size_choice.get()))
+        ttk.Label(settings, text="Ctrl + / − to resize text · Ctrl 0 to reset", style="Caption.TLabel", wraplength=420).grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=SPACE["control"])
+        self.reset_layout_button = ttk.Button(settings, text="Reset panel sizes", command=self.reset_layout)
+        self.reset_layout_button.grid(row=10, column=0, columnspan=2, sticky="ew")
         self.health = tk.StringVar(value="Waiting for device and storage status")
         ttk.Label(settings, text="Storage / recording / cameras", style="Muted.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(SPACE["section"], SPACE["small"]))
         ttk.Label(settings, textvariable=self.health, wraplength=340, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew")
-        self.details = tk.Text(details, wrap="word", width=24, height=6, **self._text_style())
-        self.details.pack(fill="both", expand=True)
+        details.columnconfigure(0, weight=1)
+        details.rowconfigure(0, weight=1)
+        details_text = ttk.Frame(details)
+        details_text.grid(row=0, column=0, sticky="nsew")
+        self.details = self._text_area(details_text, height=6)
         # Paths/provenance stay in the explicit Details tab, rather than the
         # primary operating surface. Keep this label for project integrations.
         self.folder_label = ttk.Label(details, text=str(session.folder), style="Muted.TLabel", wraplength=365)
-        self.folder_label.pack(fill="x", pady=(SPACE["control"], 0))
-        records = ttk.Frame(side)
-        records.grid(row=4, sticky="ew", pady=(SPACE["control"], 0))
-        ttk.Button(records, text="Save notes [W]", command=self.save).pack(side="left")
+        self.folder_label.grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
+        records = ttk.Frame(results)
+        records.grid(row=6,sticky="ew",pady=(SPACE["control"],0))
         self.delete_button = ttk.Button(records, text="Delete last [D]", command=self.delete, state="disabled")
         self.delete_button.pack(side="right")
-        ttk.Label(root, textvariable=self.status, wraplength=1380, padding=(SPACE["section"], SPACE["control"]), style="Muted.TLabel").grid(row=2, sticky="ew")
+        ttk.Button(notes,text="Save notes [W]",command=self.save).grid(row=1,column=0,sticky="e",pady=(SPACE["control"],0))
+        self.status_label = ttk.Label(root, textvariable=self.status, wraplength=1380, padding=(SPACE["section"], SPACE["small"]), style="Caption.TLabel")
+        self.status_label.grid(row=4, sticky="ew")
         root.bind("<KeyPress>", self.keypress)
         root.bind("<KeyRelease>", self.keyrelease)
         root.bind("<FocusOut>", self._clear_shortcuts)
         root.bind("<Configure>", self._resize_copy)
+        for binding, delta in (("<Control-plus>",1), ("<Control-equal>",1), ("<Control-minus>",-1)):
+            root.bind(binding, lambda _event, delta=delta:(self.change_text_size(delta), "break")[-1])
+        root.bind("<Control-Key-0>", lambda _event:(self.set_text_size(14), "break")[-1])
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._rows_seen = None
         self._details_seen = None
+        self._layout_workspace()
         session.start()
         root.after(80, self.refresh)
+
+    def _display_task(self):
+        explicit = self.session.config.metadata.get("display_task")
+        return str(explicit) if explicit else str(self.session.config.task).replace("_", " ").title()
+
+    def _text_area(self, parent, *, height, title=None):
+        parent.columnconfigure(0, weight=1)
+        row = 1 if title else 0
+        parent.rowconfigure(row, weight=1)
+        if title:
+            ttk.Label(parent,text=title,style="Caption.TLabel").grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,SPACE["small"]))
+        text = tk.Text(parent, wrap="word", width=24, height=height, **self._text_style())
+        text.grid(row=row, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=text.yview)
+        scrollbar.grid(row=row, column=1, sticky="ns")
+        text.configure(yscrollcommand=scrollbar.set)
+        return text
+
+    def _display_method(self):
+        metadata = getattr(self.session.policy, "metadata", {})
+        return str(metadata.get("display_method") or self.session.config.metadata.get("display_method")
+                   or self.session.config.method).replace("_", " ")
+
+    def _pane(self, parent, **options):
+        pane = ResizablePane(parent, preferences=self.preferences, **options)
+        self._workspace_panes.append(pane)
+        return pane
+
+    def _scoreboard(self, parent):
+        self.scoreboard = ttk.Frame(parent, padding=(SPACE["section"], SPACE["small"]))
+        self.scoreboard.grid(row=1, sticky="ew")
+        self.scoreboard.columnconfigure(4, weight=1)
+        self.score_context = ttk.Frame(self.scoreboard)
+        self.score_context.grid(row=0,column=0,columnspan=5,sticky="ew")
+        self.score_context.columnconfigure(0,weight=1)
+        self.score_scope = tk.StringVar(value="Saved in this session")
+        ttk.Label(self.score_context, textvariable=self.score_scope, style="Caption.TLabel").grid(
+            row=0,column=0,sticky="w")
+        self.score_vars, self.score_labels, self.score_cells, self.score_captions = {}, {}, {}, {}
+        for column, (key, label, style) in enumerate((("success","Success","Success.Score.TLabel"),
+                    ("failure","Failure","Failure.Score.TLabel"), ("rate","Success rate","Score.TLabel"),
+                    ("total","Total","Score.TLabel"))):
+            cell = ttk.Frame(self.scoreboard, padding=(0, SPACE["small"], SPACE["section"], 0))
+            self.score_cells[key] = cell
+            cell.grid(row=1, column=column, sticky="ew")
+            self.score_vars[key] = variable = tk.StringVar(value="—" if key == "rate" else "0")
+            self.score_labels[key] = ttk.Label(cell, textvariable=variable, style=style, anchor="w")
+            self.score_labels[key].pack(anchor="w")
+            self.score_captions[key] = caption = ttk.Label(cell,text=label,style="Caption.TLabel")
+            caption.pack(anchor="w")
+        self.automatic_count = tk.StringVar(value="Automatic failures: 0")
+        self.automatic_count_label = ttk.Label(self.score_context,textvariable=self.automatic_count,style="Caption.TLabel")
+        self.automatic_count_label.grid(row=0,column=1,sticky="e")
+
+    def _update_scoreboard(self, results):
+        successes = sum(row.get("outcome") == "success" for row in results)
+        failures = sum(row.get("outcome") == "failure" for row in results)
+        total = successes+failures
+        automatic = sum(row.get("outcome") == "failure" and row.get("outcome_source") == "automatic_fault" for row in results)
+        rate = f"{100*successes/total:.1f}%" if total else "—"
+        for key, value in (("success",successes), ("failure",failures), ("total",total), ("rate",rate)):
+            self.score_vars[key].set(str(value))
+        self.automatic_count.set(f"Automatic failures: {automatic}")
+        self.counts.set(f"Success {successes}  ·  Failure {failures}  ·  SR {rate}")
+
+    def set_text_size(self, value):
+        value = max(12, min(24, int(value)))
+        self._preferences_changed = True
+        self.text_size = value
+        self.preferences.set("text_size", value)
+        self._configure_theme()
+        if hasattr(self, "text_size_label"):
+            self.text_size_label.configure(text=f"{value} pt")
+        if hasattr(self, "text_size_choice"):
+            self.text_size_choice.set(str(value))
+        if hasattr(self, "table"):
+            self._size_result_columns()
+        self._schedule_layout()
+        self._schedule_preferences()
+        return value
+
+    def _size_result_columns(self):
+        for column, samples in (("run",("Run","999")),("result",("Outcome","success","failure")),
+                                ("steps",("Steps","9999")),("hz",("Hz","200.0"))):
+            width = max(self.fonts["body"].measure(text) for text in samples)+2*SPACE["control"]
+            self.table.column(column,width=width,minwidth=width,stretch=False)
+
+    def change_text_size(self, delta):
+        return self.set_text_size(self.text_size+delta)
+
+    def toggle_context(self):
+        self._short_context_open = not self._short_context_open
+        self._schedule_layout()
+
+    def reset_layout(self):
+        self._preferences_changed = True
+        for pane in self._workspace_panes:
+            pane.reset()
+        self._schedule_layout()
+
+    def _schedule_layout(self):
+        if self.closing:
+            return
+        if self._layout_job is not None:
+            self.root.after_cancel(self._layout_job)
+        self._layout_job = self.root.after_idle(self._layout_workspace)
+
+    def _inspector_resized(self, event):
+        if event.width != self._inspector_width:
+            self._inspector_width = event.width
+            self._schedule_layout()
+
+    def _workspace_resized(self, event=None):
+        if self.closing or not hasattr(self,"workspace_canvas"):
+            return
+        width, height = self.workspace_canvas.winfo_width(), self.workspace_canvas.winfo_height()
+        content_height = max(height, round(320*self.text_size/14))
+        self.workspace_canvas.itemconfigure(self._workspace_window,width=max(1,width),height=content_height)
+        self.workspace_canvas.configure(scrollregion=(0,0,max(1,width),content_height))
+        if content_height>height:
+            self.workspace_scrollbar.grid()
+        else:
+            self.workspace_scrollbar.grid_remove()
+            self.workspace_canvas.yview_moveto(0)
+
+    def _schedule_preferences(self):
+        if self.closing:
+            return
+        if self._preferences_job is not None:
+            self.root.after_cancel(self._preferences_job)
+        self._preferences_job = self.root.after(350, self._save_preferences)
+
+    def _save_preferences(self):
+        if self._preferences_job is not None:
+            self.root.after_cancel(self._preferences_job)
+        self._preferences_job = None
+        if not self.root.winfo_exists():
+            return
+        # Invalid/unknown preference files remain available for inspection until
+        # the operator deliberately changes a presentation setting.
+        if self.preferences.error and not self._preferences_changed:
+            return
+        self.preferences.set("window", {"width": self.root.winfo_width(), "height": self.root.winfo_height(),
+                                       "x": self.root.winfo_x(), "y": self.root.winfo_y()})
+        self.preferences.flush()
+
+    def _layout_workspace(self):
+        self._layout_job = None
+        if self.closing or not hasattr(self, "main_pane") or not self.root.winfo_exists():
+            return
+        width = max(1, self.root.winfo_width())
+        scale = self.text_size/14
+        available = max(1, width-2*SPACE["section"])
+        self._workspace_resized()
+        self._compact_chrome = bool(self.root.winfo_ismapped() and self.root.winfo_height()<820 and self.text_size>=18)
+        self.heading.configure(padding=(SPACE["section"],2 if self._compact_chrome else SPACE["control"]))
+        self.scoreboard.configure(padding=(SPACE["section"],0 if self._compact_chrome else SPACE["small"]))
+        self.controls.configure(padding=(SPACE["section"],0 if self._compact_chrome else SPACE["small"]))
+        self.fonts["score"].configure(size=max(30,self.text_size+10) if self._compact_chrome else round(self.text_size*32/14))
+        for column, label in enumerate(("Success", "Failure", "Success rate", "Total")):
+            key = ("success","failure","rate","total")[column]
+            sample = "100.0%" if column == 2 else "000"
+            if self._compact_chrome:
+                self.score_labels[key].pack_configure(side="left",anchor="center")
+                self.score_captions[key].pack_configure(side="left",anchor="center",padx=(SPACE["small"],0))
+                minimum = self.fonts["caption"].measure(label)+self.fonts["score"].measure(self.score_vars[key].get())+SPACE["small"]
+            else:
+                self.score_labels[key].pack_configure(side="top",anchor="w")
+                self.score_captions[key].pack_configure(side="top",anchor="w",padx=0)
+                minimum = max(self.fonts["caption"].measure(label), self.fonts["score"].measure(sample))
+            self.scoreboard.columnconfigure(column,minsize=minimum+SPACE["section"])
+        minimum_first, minimum_second = 280, min(round(390*scale), round(available*.62))
+        orientation = "vertical" if available < 760 else "horizontal"
+        self.main_pane.set_orientation(orientation, persist=False)
+        self.main_pane.set_minimums(first=minimum_first if orientation == "horizontal" else 130,
+                                   second=minimum_second if orientation == "horizontal" else 150)
+        # A second header row preserves readable controls instead of allowing
+        # long task names or large text to squeeze the operating state away.
+        tools = ([self.checkpoint_toggle] if self.reload_fields else [])+[self.help_button]
+        if self._compact_chrome:
+            tools.append(self.context_button)
+            self.context_button.configure(text="Hide context" if self._short_context_open else "Context")
+            self.text_size_label.pack_forget()
+        else:
+            self.context_button.grid_remove()
+            self.text_size_label.pack(side="left",after=self.smaller_text_button,padx=SPACE["small"])
+        tools += [self.zoom_controls,self.exit_button]
+        compact = sum(widget.winfo_reqwidth()+SPACE["control"] for widget in tools)+self.state_label.winfo_reqwidth()+260 > available
+        self.heading_label.grid_configure(row=0,column=0,columnspan=1,sticky="w")
+        self.state_label.grid_configure(row=0,column=1,columnspan=1,sticky="e")
+        if compact:
+            self.heading_label.grid_configure(columnspan=5)
+            self.state_label.grid_configure(column=5)
+            self.header_tools.grid(row=1,column=0,columnspan=6,sticky="ew",pady=(SPACE["small"],0))
+            row, column, used = 0, 0, 0
+            for index, widget in enumerate(tools):
+                requested = widget.winfo_reqwidth()+SPACE["control"]
+                if column and used+requested>available:
+                    row, column, used = row+1, 0, 0
+                widget.grid_configure(in_=self.header_tools,row=row,column=column,columnspan=1,sticky="w",pady=0)
+                used, column = used+requested, column+1
+            instruction_row, identity_row = 2, 3
+            self.heading_label.configure(wraplength=max(200,available-self.state_label.winfo_reqwidth()-SPACE["group"]))
+        else:
+            self.header_tools.grid_remove()
+            for index, widget in enumerate(tools,start=2):
+                widget.grid_configure(in_=self.heading,row=0,column=index,columnspan=1,sticky="e",pady=0)
+            instruction_row, identity_row = 1, 2
+            self.heading_label.configure(wraplength=max(200,available-sum(widget.winfo_reqwidth()+SPACE["control"] for widget in tools)-self.state_label.winfo_reqwidth()-SPACE["group"]))
+        self.instruction_label.grid_configure(row=instruction_row,columnspan=6)
+        self.identity_label.grid_configure(row=identity_row,columnspan=6)
+        if self._compact_chrome and not self._short_context_open:
+            self.instruction_label.grid_remove()
+            self.identity_label.grid_remove()
+        else:
+            self.instruction_label.grid()
+            self.identity_label.grid()
+        self.instruction_label.configure(wraplength=max(300, available))
+        self.identity_label.configure(wraplength=max(300, available))
+        self.status_label.configure(wraplength=max(300, available))
+        requested = sum(button.winfo_reqwidth()+SPACE["control"] for button in self.run_buttons)
+        columns = 7 if requested <= available else 4
+        for column in range(7):
+            self.controls.columnconfigure(column, weight=1 if column<columns else 0,
+                                          uniform="run_actions" if column<columns else "")
+        for index, button in enumerate(self.run_buttons):
+            row, column = divmod(index, columns)
+            button.grid(row=row, column=column, sticky="ew", padx=(0, SPACE["control"]) if column<columns-1 else 0,
+                        pady=(0, SPACE["small"]) if columns<7 else 0)
+        if hasattr(self, "inspector_pane"):
+            pane_width = max(220, self.main_pane.second.winfo_width()-2*SPACE["control"])
+            tab_width = sum(self.fonts["body"].measure(self.tabs.tab(tab,"text"))+2*SPACE["control"]+4 for tab in self.tabs.tabs())
+            compact_tabs = pane_width < tab_width
+            self.tabs.configure(style="Compact.TNotebook" if compact_tabs else "TNotebook")
+            if compact_tabs:
+                self.view_selector.grid(row=0,column=0,sticky="ew")
+            else:
+                self.view_selector.grid_remove()
+            self.control_hint.configure(wraplength=pane_width)
+            self.measurement_label.configure(wraplength=pane_width)
+            self.inspector_pane.set_minimums(first=self.control_hint.winfo_reqheight()+self.measurement_label.winfo_reqheight()+3*SPACE["small"],
+                                            second=max(150,round(150*scale)))
+            for label in (self.failure_note_label, self.result_summary_label, self.folder_label):
+                label.configure(wraplength=pane_width)
+            self._fit_secondary_labels(self.inspector_pane,pane_width)
+        if self._selection_cells:
+            self._layout_checkpoint_form()
+
+    def _fit_secondary_labels(self, parent, available):
+        for child in parent.winfo_children():
+            if isinstance(child,ttk.Label) and child.cget("wraplength") and self.root.winfo_pixels(child.cget("wraplength"))>0:
+                parent_width = child.master.winfo_width()
+                limit = min(available,parent_width-2*SPACE["control"]) if parent_width>120 else available
+                if self.root.winfo_pixels(child.cget("wraplength")) != max(100,limit):
+                    child.configure(wraplength=max(100,limit))
+            if child.winfo_children():
+                self._fit_secondary_labels(child,available)
+
+    def _layout_checkpoint_form(self):
+        if not hasattr(self, "_selection_form"):
+            return
+        width = max(1, self._selection_form.winfo_width())
+        viewport = self.workspace_canvas.winfo_height()
+        if viewport>1:
+            # Keep a useful preview below an open selection form. The form owns
+            # its scrolling; Load remains outside that scrolling region.
+            scale = self.text_size/14
+            self._selection_form.scroll_canvas.configure(height=max(round(70*scale),min(round(235*scale),round(viewport*.40-90*scale))))
+        cell_minimum = round(300*self.text_size/14)
+        columns = max(1, min(3, width//cell_minimum))
+        for column in range(3):
+            self._selection_form.columnconfigure(column, weight=1 if column<columns else 0,
+                                                 uniform="selection" if column<columns else "")
+        index = 0
+        for cell, advanced in self._selection_cells:
+            if advanced and not self._advanced_fields_open:
+                cell.grid_remove()
+                continue
+            row, column = divmod(index, columns)
+            cell.grid(row=row, column=column, sticky="ew",
+                      padx=(0, SPACE["control"]) if column<columns-1 else 0, pady=(0, SPACE["control"]))
+            index += 1
+        for widget, variable, hint in self._selection_choice_hints:
+            width = max(80,widget.winfo_width()-2*SPACE["control"])
+            hint.configure(wraplength=width)
+            if self.fonts["body"].measure(variable.get())>width-20:
+                hint.grid(row=2,column=0,columnspan=2,sticky="ew",pady=(SPACE["small"],0))
+            else:
+                hint.grid_remove()
+
+    def toggle_advanced_fields(self):
+        self._advanced_fields_open = not self._advanced_fields_open
+        self.advanced_fields_button.configure(text="Hide advanced settings" if self._advanced_fields_open else "Advanced settings")
+        self._layout_checkpoint_form()
 
     def _scrollable_content(self, parent, *, height=None):
         parent.columnconfigure(0, weight=1)
@@ -259,10 +636,32 @@ class DeploymentGUI:
         window = canvas.create_window(0, 0, anchor="nw", window=inner)
         inner.bind("<Configure>", lambda _event:canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event:canvas.itemconfigure(window, width=max(1,event.width)))
+        self._scroll_regions.append((canvas,inner))
         # Use the visible scrollbar rather than global wheel bindings that can
         # steal scrolling from notes or accidentally change a camera combobox.
         inner.scroll_canvas = canvas
         return inner
+
+    def _reveal_focus(self, event, canvas, content):
+        widget = event.widget
+        if self.closing or not str(widget).startswith(str(content)+".") or not canvas.winfo_viewable():
+            return
+        if canvas is self.workspace_canvas:
+            # Reveal a nested form first, then reveal its newly visible control
+            # in the workspace viewport. Reversing these steps loses focus offscreen.
+            for inner_canvas,inner_content in self._scroll_regions:
+                if str(widget).startswith(str(inner_content)+"."):
+                    self._reveal_focus(event,inner_canvas,inner_content)
+        bounds = canvas.bbox("all")
+        if not bounds or canvas.winfo_height()<2:
+            return
+        top = widget.winfo_rooty()-content.winfo_rooty()
+        bottom = top+widget.winfo_height()
+        current = canvas.canvasy(0)
+        height = canvas.winfo_height()
+        target = max(0,top-SPACE["control"]) if top<current else bottom-height+SPACE["control"] if bottom>current+height else current
+        if target != current:
+            canvas.yview_moveto(target/max(1,bounds[3]))
 
     def _devices_panel(self, parent):
         parent.columnconfigure(1, weight=1)
@@ -452,7 +851,7 @@ class DeploymentGUI:
                 age_text += f" · preview {fps:.1f} fps"
             rows.append(f"{role.title()}: {age_text}")
             if role in self.camera_title_vars:
-                self.camera_title_vars[role].set(f"{role.title()} · {actual.get(role) or 'unassigned'}")
+                self.camera_title_vars[role].set(role.title())
         self.camera_health.set("\n".join(rows))
         storage = health.get("disk_free_bytes")
         messages = [f"Free storage {storage/2**30:.1f} GiB" if self._finite_number(storage) else "Storage status unavailable"]
@@ -473,17 +872,33 @@ class DeploymentGUI:
 
     def _configure_theme(self):
         self.root.configure(bg=THEME["canvas"])
-        family = tkfont.nametofont("TkDefaultFont").actual("family")
+        available_families = set(tkfont.families(root=self.root))
+        family = getattr(self, "_font_family", "Noto Sans CJK KR" if "Noto Sans CJK KR" in available_families
+                         else tkfont.nametofont("TkDefaultFont", root=self.root).actual("family"))
         self._font_family = family
-        self.root.option_add("*Font", (family, 11))
+        if not hasattr(self, "fonts"):
+            self.fonts = {role:tkfont.Font(root=self.root, family=family) for role in
+                          ("body", "caption", "heading", "state", "score")}
+        for role, size, weight in (("body",self.text_size,"normal"),
+                                  ("caption",max(12,self.text_size-1),"normal"),
+                                  ("heading",self.text_size+4,"bold"),
+                                  ("state",self.text_size,"bold"),
+                                  ("score",round(self.text_size*32/14),"bold")):
+            self.fonts[role].configure(family=family, size=size, weight=weight)
+        tkfont.nametofont("TkDefaultFont", root=self.root).configure(family=family, size=self.text_size)
+        tkfont.nametofont("TkTextFont", root=self.root).configure(family=family, size=self.text_size)
         self.style = style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure(".", background=THEME["canvas"], foreground=THEME["text"], font=(family, 11))
+        style.configure(".", background=THEME["canvas"], foreground=THEME["text"], font=self.fonts["body"])
         style.configure("TFrame", background=THEME["canvas"])
         style.configure("TLabel", background=THEME["canvas"], foreground=THEME["text"])
         style.configure("Muted.TLabel", foreground=THEME["muted"])
-        style.configure("Heading.TLabel", font=(family, 18, "bold"))
-        style.configure("State.TLabel", background=THEME["inset"], font=(family, 10, "bold"))
+        style.configure("Caption.TLabel", foreground=THEME["muted"], font=self.fonts["caption"])
+        style.configure("Heading.TLabel", font=self.fonts["heading"])
+        style.configure("State.TLabel", background=THEME["inset"], font=self.fonts["state"])
+        style.configure("Score.TLabel", font=self.fonts["score"])
+        style.configure("Success.Score.TLabel", foreground=THEME["accent"])
+        style.configure("Failure.Score.TLabel", foreground=THEME["danger"])
         for name, color in (("Ready", THEME["accent"]), ("Fault", THEME["danger"]), ("Pending", THEME["warning"])):
             style.configure(f"{name}.State.TLabel", foreground=color)
         style.configure("TButton", background=THEME["inset"], foreground=THEME["text"], padding=(SPACE["control"], SPACE["button_y"]), bordercolor=THEME["border"], lightcolor=THEME["inset"], darkcolor=THEME["inset"], borderwidth=1, focusthickness=2, focuscolor=THEME["accent"])
@@ -500,33 +915,39 @@ class DeploymentGUI:
         self.root.option_add("*TCombobox*Listbox.background", THEME["panel"])
         self.root.option_add("*TCombobox*Listbox.foreground", THEME["text"])
         self.root.option_add("*TCombobox*Listbox.selectBackground", THEME["selection"])
-        style.configure("Treeview", rowheight=28, font=(family, 10), background=THEME["panel"], fieldbackground=THEME["panel"], foreground=THEME["text"], borderwidth=0)
+        style.configure("Treeview", rowheight=self.fonts["body"].metrics("linespace")+max(10,round(12*self.text_size/14)),
+                        font=self.fonts["body"], background=THEME["panel"], fieldbackground=THEME["panel"], foreground=THEME["text"], borderwidth=0)
         style.map("Treeview", background=[("selected", THEME["selection"])], foreground=[("selected", THEME["text"])])
         style.configure("Treeview.Heading", background=THEME["inset"], foreground=THEME["muted"], padding=(SPACE["small"], SPACE["control"]), borderwidth=0)
         style.configure("TNotebook", background=THEME["canvas"], borderwidth=0, tabmargins=0)
         style.configure("TNotebook.Tab", background=THEME["panel"], foreground=THEME["muted"], padding=(SPACE["control"], SPACE["control"]))
         style.map("TNotebook.Tab", background=[("selected", THEME["inset"])], foreground=[("selected", THEME["text"])])
+        style.layout("Compact.TNotebook.Tab", [])
 
     def _text_style(self):
         return {"background": THEME["panel"], "foreground": THEME["text"], "insertbackground": THEME["text"],
+                "font": self.fonts["body"],
                 "selectbackground": THEME["selection"], "selectforeground": THEME["text"], "relief": "flat",
                 "highlightthickness": 1, "highlightbackground": THEME["border"], "highlightcolor": THEME["accent"], "padx": SPACE["control"], "pady": SPACE["control"]}
 
     def _resize_copy(self, event):
         if event.widget is self.root:
-            self.instruction_label.configure(wraplength=max(500, event.width - 48))
+            self._schedule_layout()
+            self._schedule_preferences()
 
     def _checkpoint_panel(self, parent):
         self.checkpoint_panel = panel = ttk.LabelFrame(parent, text="Choose a policy · nothing loads until requested", padding=SPACE["control"])
         panel.grid(row=0, column=0, sticky="ew", pady=(0, SPACE["group"]))
         panel.columnconfigure(0, weight=1)
-        form = self._scrollable_content(panel, height=235)
+        form = self._selection_form = self._scrollable_content(panel, height=235)
+        form.bind("<Configure>", lambda _event:self._layout_checkpoint_form(),add="+")
         selected = self.session.config.metadata.get("reload_selection", {})
         for index, field in enumerate(self.reload_fields):
             row, column = divmod(index, 3)
             form.columnconfigure(column, weight=1, uniform="selection")
             cell = ttk.Frame(form)
             cell.grid(row=row, column=column, sticky="ew", padx=(0, SPACE["control"]) if column != 2 else 0, pady=(0, SPACE["control"]))
+            self._selection_cells.append((cell, bool(field.get("advanced"))))
             cell.columnconfigure(0, weight=1)
             key, kind = field["key"], field.get("kind", "text")
             value = selected.get(key, field.get("value", ""))
@@ -535,6 +956,10 @@ class DeploymentGUI:
             if kind == "choice":
                 widget = ttk.Combobox(cell, textvariable=variable, values=field.get("choices", ()), state="readonly", width=1)
                 widget.bind("<<ComboboxSelected>>", lambda _event, key=key:self.resolve_selection(key))
+                hint = ttk.Label(cell,textvariable=variable,style="Caption.TLabel",wraplength=250)
+                self._selection_choice_hints.append((widget,variable,hint))
+                variable.trace_add("write",lambda *_args:self._schedule_layout())
+                widget.bind("<Configure>",lambda _event:self._schedule_layout(),add="+")
             else:
                 widget = ttk.Entry(cell, textvariable=variable, width=1)
                 if field.get("readonly"):
@@ -545,8 +970,11 @@ class DeploymentGUI:
                 button = ttk.Button(cell, text="Browse", command=lambda field=field:self.browse_checkpoint(field))
                 button.grid(row=1, column=1, padx=(SPACE["small"], 0))
                 self.reload_widgets.append((button, "disabled" if field.get("readonly") else "normal"))
+        self.advanced_fields_button = ttk.Button(panel, text="Advanced settings", command=self.toggle_advanced_fields)
+        if any(advanced for _cell, advanced in self._selection_cells):
+            self.advanced_fields_button.grid(row=1, column=0, sticky="w", pady=(SPACE["small"], 0))
         files = ttk.Frame(panel)
-        files.grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
+        files.grid(row=2, column=0, sticky="ew", pady=(SPACE["control"], 0))
         files.columnconfigure(0, weight=1)
         config_buttons = ttk.Frame(files)
         config_buttons.grid(row=0, column=0, sticky="w")
@@ -559,10 +987,11 @@ class DeploymentGUI:
         self.load_button = ttk.Button(files, text="Load checkpoint", style="Accent.TButton", command=self.load_checkpoint, state="disabled")
         self.load_button.grid(row=0, column=1, sticky="e")
         self.load_error = tk.Text(panel, height=4, wrap="word", **self._text_style())
-        self.load_error.grid(row=2, column=0, sticky="ew", pady=(SPACE["control"], 0))
+        self.load_error.grid(row=3, column=0, sticky="ew", pady=(SPACE["control"], 0))
         self.load_error.configure(state="disabled")
         self.load_error.grid_remove()
         self._record_selection(self.session, self.current_selection())
+        self._layout_checkpoint_form()
         self._set_checkpoint_expanded(bool(self.session.config.metadata.get("defer_policy_load", False)))
 
     def _set_checkpoint_expanded(self, expanded):
@@ -572,6 +1001,7 @@ class DeploymentGUI:
         else:
             self.checkpoint_panel.grid_remove()
         self.checkpoint_toggle.configure(text="Hide task / checkpoint" if expanded else "Task / checkpoint...")
+        self._schedule_layout()
 
     def toggle_checkpoint_panel(self):
         if not self.closing:
@@ -755,8 +1185,9 @@ class DeploymentGUI:
 
     def _bind_session(self, session):
         self.session = session
+        self._last_displayed_state = None
         self.root.title(f"{session.config.method} | {session.config.task} deployment")
-        self.heading_label.configure(text=f"{session.config.task.title()}  /  {session.config.method}")
+        self.heading_label.configure(text=self._display_task())
         self.instruction_label.configure(text=session.config.instruction)
         self.folder_label.configure(text=str(session.folder))
         self.hz.set(str(session.config.target_hz))
@@ -819,31 +1250,49 @@ class DeploymentGUI:
                 self.status.set(event[1])
 
     def _image_pair(self,parent,title,row,roles=None):
-        panel = ttk.LabelFrame(parent,text=title,padding=8)
-        panel.grid(row=row,sticky="nsew",pady=(0,10))
+        panel = ttk.Frame(parent, padding=SPACE["small"])
+        panel.grid(row=row, column=0, sticky="nsew")
         roles=roles or self.session.config.camera_roles
-        for column in range(len(roles)):
-            panel.columnconfigure(column,weight=1)
-        panel.rowconfigure(1,weight=1)
+        live = title == "Live observations"
+        if len(roles) == 2:
+            pane = self._pane(panel, key="observations" if live else "reference_cameras", orient="horizontal",
+                              first_label=roles[0].title(), second_label=roles[1].title(), first_min=140,
+                              second_min=140, default_fraction=.5, collapsible=(True,True), show_header=False)
+            pane.pack(fill="both", expand=True)
+            containers = (pane.first, pane.second)
+            if live:
+                self.camera_pane = pane
+        else:
+            containers = []
+            for column in range(len(roles)):
+                panel.columnconfigure(column, weight=1)
+                frame = ttk.Frame(panel)
+                frame.grid(row=0, column=column, sticky="nsew")
+                containers.append(frame)
+            panel.rowconfigure(0, weight=1)
         labels=[]
-        for column,role in enumerate(roles):
-            if title == "Live observations":
+        for container, role in zip(containers, roles):
+            container.columnconfigure(0, weight=1)
+            container.rowconfigure(1, weight=1)
+            if live:
                 self.camera_title_vars[role] = variable = tk.StringVar(value=role.title())
-                ttk.Label(panel, textvariable=variable).grid(row=0,column=column,sticky="w",pady=(0,4))
+                ttk.Label(container, textvariable=variable, style="Caption.TLabel").grid(row=0,column=0,sticky="w",pady=(0,4))
             else:
-                ttk.Label(panel,text=role.title()).grid(row=0,column=column,sticky="w",pady=(0,4))
-            label=tk.Label(panel,bg=THEME["panel"],fg=THEME["muted"],text="Waiting for frame",width=1,height=1)
-            label.grid(row=1,column=column,sticky="nsew",padx=(0,4) if column==0 else (4,0))
-            if title == "Live observations":
+                ttk.Label(container,text=role.title(), style="Caption.TLabel").grid(row=0,column=0,sticky="w",pady=(0,4))
+            label=tk.Label(container,bg=THEME["panel"],fg=THEME["muted"],text="Waiting for frame",width=1,height=1, font=self.fonts["body"])
+            label.grid(row=1,column=0,sticky="nsew")
+            if live:
                 label.bind("<Double-Button-1>", lambda _event, role=role:self.zoom_live(role))
             labels.append(label)
+        if not live:
+            self.reference_images_panel = panel
         return labels
 
     def _references(self,parent):
         frame=ttk.Frame(parent)
         self._reference_parent = parent
         self._reference_error = None
-        frame.grid(row=2,sticky="nsew")
+        frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(0,weight=1)
         frame.rowconfigure(1,weight=1)
         toolbar=ttk.Frame(frame)
@@ -860,7 +1309,7 @@ class DeploymentGUI:
         self.reference_counter = ttk.Label(toolbar, textvariable=self.reference_var, style="Muted.TLabel")
         self.reference_counter.pack(side="left", padx=8)
         self.reference_labels=self._image_pair(frame,"Episode start · never policy input",1,roles=("primary","wrist"))
-        self.reference_panel = self.reference_labels[0].master
+        self.reference_panel = self.reference_images_panel
         self._sync_reference_visibility()
         self.show_reference()
 
@@ -884,13 +1333,13 @@ class DeploymentGUI:
     def _sync_reference_visibility(self):
         if self.catalog:
             self.reference_panel.grid()
-            self._reference_parent.rowconfigure(2, weight=1)
+            self.visual_pane.set_visible("second", True, persist=False)
             self.reference_title.configure(text="Training start reference")
             for button in self.reference_buttons:
                 button.pack(side="left", padx=2, before=self.reference_counter)
         else:
             self.reference_panel.grid_remove()
-            self._reference_parent.rowconfigure(2, weight=0)
+            self.visual_pane.set_visible("second", False, persist=False)
             self.reference_title.configure(text="No training reference selected" if not self._reference_error else "Training reference unavailable")
             for button in self.reference_buttons:
                 button.pack_forget()
@@ -1306,13 +1755,12 @@ class DeploymentGUI:
         if state == "SELECTING":
             self.active_identity.set("No policy loaded · camera preview only")
         else:
-            identity = [f"Active: {self.session.config.method}"]
-            gate = policy_metadata.get("gate") or self.session.config.metadata.get("gate")
-            gate_status = policy_metadata.get("gate_status") or self.session.config.metadata.get("gate_status")
-            if gate:
-                identity.append(f"Gate {gate}")
-            if gate_status:
-                identity.append(str(gate_status))
+            identity = [self._display_method()]
+            mode = policy_metadata.get("gate_mode") or self.session.config.metadata.get("gate_mode")
+            calibrated = policy_metadata.get("gate_calibrated", self.session.config.metadata.get("gate_calibrated"))
+            if mode and mode != "fixed_chunk":
+                identity.append(str(mode).replace("_", " ").upper())
+                identity.append("Calibrated" if calibrated else "Uncalibrated candidate")
             self.active_identity.set(" · ".join(identity))
         if state == "ERROR" and self.session._startup_error and self._load_error_session is not self.session:
             self._load_error_session = self.session
@@ -1340,11 +1788,14 @@ class DeploymentGUI:
         elif state == "CONNECTING_PREVIEW":
             self.status.set("Opening camera preview. Policy and robot control remain disconnected.")
         elif state == "SELECTING":
-            self.status.set("Choose a task and checkpoint, then Load checkpoint. No policy is loaded.")
+            self.status.set("Select a task and checkpoint, then Load checkpoint.")
         elif state == "CAMERA_ERROR":
             self.status.set("Camera unavailable. Open Devices to change assignments or restart preview; the loaded policy is preserved.")
         elif state == "RECONFIGURING":
             self.status.set("Changing camera streams. No motion is requested; Start remains a separate action.")
+        elif state == "READY" and self._last_displayed_state in {None,"CONNECTING","LOADING_POLICY","CONNECTING_PREVIEW","SELECTING"}:
+            self.status.set("Ready. Start prepares a fresh rollout.")
+        self._last_displayed_state = state
         ready=state=="READY" and not self.closing and not self._reload_in_progress
         recovery=state in {"RECOVERY_REQUIRED", "RECOVERING"} or self.session._recovery_fault
         active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING", "RECOVERY_REQUIRED", "RECOVERING"}
@@ -1366,7 +1817,7 @@ class DeploymentGUI:
         elif ready and not health.get("can_start", True):
             self.control_hint.configure(text="Start unavailable: " + str(health.get("reason") or "Check device and storage status") + "\nOpen Devices / Settings to resolve it.", foreground=THEME["warning"])
         else:
-            self.control_hint.configure(text="Start: home, then a fresh rollout.\n" + self._home_description(), foreground=THEME["muted"])
+            self.control_hint.configure(text="Start homes; Home is an idle move.",foreground=THEME["muted"])
         for button in (self.success_button,self.failure_button):
             button.configure(state="normal" if state in {"RUNNING","WAITING_OUTCOME"} else "disabled")
         for widget in (self.apply_button,self.hz_entry,self.steps_entry,self.record_video_toggle):
@@ -1388,21 +1839,11 @@ class DeploymentGUI:
         hz=stats["achieved_command_hz"]
         self.metrics.set(f"Target {self.session.config.target_hz:g} Hz   ·   Actual {hz:.2f} Hz" if hz is not None else f"Target {self.session.config.target_hz:g} Hz   ·   Actual —")
         self.metrics.set(self.metrics.get() + f"\nActions {stats['steps']}   ·   Interval {stats['active_duration_s']:.1f} s")
-        if latency:
-            self.metrics.set(self.metrics.get() + f"\nPolicy / step {latency['mean_ms']:.1f} ms (mean)")
-        gpu = stats["latency"].get("model_gpu_ms")
-        if gpu and self._finite_number(gpu.get("amortized_ms_per_executed_action")):
-            self.metrics.set(self.metrics.get() + f"\nGPU / action {gpu['amortized_ms_per_executed_action']:.1f} ms")
-        misses = stats.get("deadline_misses")
-        if isinstance(misses, int):
-            self.metrics.set(self.metrics.get() + f"   ·   Late {misses}")
-        calls, requests = stats.get("backbone_calls"), stats.get("rpc_requests")
-        if isinstance(calls, int) and isinstance(requests, int):
-            self.metrics.set(self.metrics.get() + f"\nBackbone calls {calls}   ·   RPC requests {requests}")
-        successes = sum(r["outcome"] == "success" for r in results)
-        failures = sum(r["outcome"] == "failure" for r in results)
-        rate = f"{100*successes/len(results):.1f}%" if results else "—"
-        self.counts.set(f"Success {successes}  ·  Failure {failures}  ·  SR {rate}" if results else "No saved rollouts")
+        measurement_content = (self.control_hint.cget("text"),self.metrics.get())
+        if measurement_content != self._measurement_layout_seen:
+            self._measurement_layout_seen = measurement_content
+            self._schedule_layout()
+        self._update_scoreboard(results)
         rendered = [(r["id"], r["outcome"], r["steps"], f"{r['achieved_command_hz']:.1f}" if r["achieved_command_hz"] is not None else "—", self._result_reason(r)) for r in results]
         if rendered != self._rows_seen:
             previous_selection = self.table.selection()
@@ -1468,6 +1909,14 @@ class DeploymentGUI:
         if self.closing:
             return
         self.save()
+        self._save_preferences()
+        for pane in self._workspace_panes:
+            pane.close()
+        for job_name in ("_layout_job", "_preferences_job"):
+            job = getattr(self, job_name, None)
+            if job is not None:
+                self.root.after_cancel(job)
+                setattr(self, job_name, None)
         self.closing=True
         self._clear_shortcuts()
         self._reload_cancel.set()
