@@ -284,7 +284,7 @@ class CameraOnlyAdapter(unittest.TestCase):
             "rtde_receive": SimpleNamespace(RTDEReceiveInterface=Receive),
             "scipy.spatial.transform": SimpleNamespace(Rotation=object)}
         config = UR5eConfig(robot_ip="127.0.0.1", camera_serials={"primary":"mock-a", "wrist":"mock-b"},
-                            home_joints=(0.0,)*6)
+                            home_joints=(0.0,)*6,width=2,height=2)
         environment = UR5eEmbodiment(config)
         with patch.dict("sys.modules", modules), patch.object(driver, "Gripper", Gripper):
             environment.connect_preview()

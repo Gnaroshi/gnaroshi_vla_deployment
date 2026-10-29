@@ -83,7 +83,10 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 | Stop `[X]`, Retry `[R]` | 현재 attempt 폐기 → 현 위치 유지 |
 | Home `[H]` | READY에서 팔만 task home으로 이동; rollout·policy reset 없음 |
 | Recover robot | 보호정지 해제 후 상태·정지 확인 → 정책 버퍼 초기화 → READY |
-| Save `[W]` | 결과와 notes 저장 |
+| Save `[W]` | 결과와 notes 저장; notes 편집도 자동 저장 |
+| Devices | 카메라 검색·역할 변경·swap·카메라만 재연결 |
+| Record video | READY에서 다음 rollout의 영상 저장 ON/OFF |
+| Help `[F1]` | 단축키·운용 안내 |
 | Delete last `[D]` | 확인 후 마지막 저장 결과/영상 삭제 |
 | Exit `[Esc]` | pending action 취소 → 미분류 attempt 폐기 → 장치 종료 |
 
@@ -139,7 +142,8 @@ worker 종료·장치 정지 확인·cleanup을 기다린 뒤 background thread�
 프로젝트 factory가 검증한 새 config로 바꿀 수 있다. 창과 선택 항목은
 유지하고 결과표·notes·측정·폴더 표시는 새 세션으로 바꾼다. 이전 결과·영상은 보존한다.
 
-잘못된 경로나 정책 로드 실패는 선택을 수정해 재시도할 수 있다. 추론·장치 오류, 정지 미확인,
+잘못된 경로나 정책 로드 실패는 선택을 수정해 재시도할 수 있다. 정책 연결·추론 오류는 Failure 저장과 정지 확인·소유 자원 정리가 모두 끝난 뒤 같은 창에서 명시적으로
+다시 Load할 수 있다. 재로딩만으로 Home이나 rollout을 시작하지 않는다. 장치 명령 오류, 정지 미확인,
 cleanup 실패는 교체를 차단한다. 로딩 중 Exit는 factory가 반환한 세션을 연결하지 않고 정리한 뒤
 창을 닫는다. 상태 검사는 `session.can_replace`, 교체 직전 종료 확인은
 `session.replacement_closed`, 종료 대기는 `session.shutdown_complete`로 구분한다.
@@ -159,6 +163,41 @@ choice 변경과 Browse 뒤에는 field key로 resolver를 호출한다. JSON Lo
 각각 `config`, `load`, `save` key로 검증한다. 화면 field와 함께 `reload_selection`의 모든 숨은
 설정도 전달한다. Runtime Apply는 context의 target Hz/max steps도 갱신한다. JSON Load는
 선택 설정만 바꾸며 실제 적용은 Load checkpoint로 수행한다.
+
+### 카메라·저장·결과 관리
+
+Devices의 **Refresh connected cameras**는 버튼을 눌렀을 때만 연결 장치 이름·serial·지원 RGB
+profile을 조회한다. 카메라 역할별로 serial을 선택하고 Apply cameras를 누르거나 Swap roles로
+선택을 바꾼다. Swap은 draft만 바꾸며 Apply 전에는 실제 스트림을 바꾸지 않는다.
+중복·미연결·비호환 카메라는 거절한다. 장치 검색은 모델·로봇·그리퍼를 연결하지 않는다.
+
+카메라 변경·Restart camera preview는 idle에서 worker가 실행한다. 기존 로봇 정지를 확인하고
+카메라 스트림만 바꾸며 **로드한 모델·이전 결과·notes를 유지**한다. 정책 buffer는 비운다.
+실행·Home·복구 동작 중에는 변경을 막는다. 카메라 오류는 CAMERA_ERROR로 남고, 같은 창에서
+카메라 재연결 후 별도의 Start로 재개한다. 진행 중 발생한 오류는 그때까지의 기록을 Failure로
+보존한다. 카메라 복구가 로봇의 보호정지를 해제하거나 다음 rollout을 자동 시작하지 않는다.
+
+Adapter는 optional `list_camera_devices()`와 `configure_cameras(serials, cancel)`를 구현한다.
+전자는 `devices/selected/configuration/warnings`, 후자는 확인된 `selected/configuration/camera_metadata`
+객체를 반환한다. enumeration과 stream open은 deadline이 있고, `camera_operation_pending`이 참이면
+새 장치 작업·motion·자원 교체를 막는다. UR5e adapter는 frame 번호 반복, 오래된 host-comparable
+sensor timestamp, 잘못된 RGB shape/type을 camera fault로 기록한다. Hardware clock을 host epoch와
+직접 비교하지 않는다. 역할 identity와 실제 교체 내역은 manifest·event·rollout에 기록한다.
+
+Settings에서 영상 녹화 ON/OFF와 runtime 설정을 바꿀 수 있다. 출력 저장 공간과 녹화 상태,
+preview 수신률·프레임 나이도 표시한다. 기본 free storage256MiB 미만이면 Home/첫 command 전에
+Start를 막고, 실행 중 부족해지면 기록을 보존하며 정지한다. Warning 기본값은2GiB다.
+`SessionConfig.metadata`의 `min_free_disk_bytes` / `warn_free_disk_bytes`로 프로젝트가 조정한다.
+카메라 FPS, target Hz, 실제 command Hz, preview 수신률은 서로 다른 값이다.
+
+Rollouts에서 결과를 선택해 폴더·카메라별 영상 열기, 경로 복사, rollout 메모를 사용할 수 있다.
+메모는 자동 저장하며 outcome·원본 step log·영상을 바꾸지 않는다. 사용자 notes도 편집 시 자동
+저장한다. 창의 checkpoint form과 설정 tab은 작은 화면에서 스크롤할 수 있다. Live image를
+더블클릭하면 해당 관측 snapshot을 확대하고 F1으로 단축키를 확인한다.
+
+GPU/RPC 지연은 관측된 호출당 평균과 전체 실행 action당 적산 평균을 구분해 저장한다.
+`amortized_ms_per_executed_action`을 이용하면 client-buffered step을 포함한 분모로 비교할 수 있다.
+Backbone calls는 prefix 갱신과 expert 경로를 합한 횟수이며 전체 RPC 수와 구분한다.
 
 ### 정책 로딩 중 카메라 미리보기
 

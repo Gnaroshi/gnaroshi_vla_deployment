@@ -229,9 +229,12 @@ class CheckpointReload(unittest.TestCase):
         self.root.update()
         self.assertFalse(self.app._checkpoint_expanded)
         self.assertFalse(self.app.checkpoint_panel.grid_info())
-        notebook = self.app.table.master.master
+        notebook = self.app.tabs
         for widget in (self.app.table, self.app.notes, self.app.details):
-            notebook.select(widget.master)
+            tab = widget
+            while tab.master is not notebook:
+                tab = tab.master
+            notebook.select(tab)
             self.root.update_idletasks()
             self.assertGreaterEqual(widget.winfo_height(), 80)
             self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
@@ -547,7 +550,7 @@ class CheckpointReload(unittest.TestCase):
         self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
                   and not self.app._reload_in_progress)
 
-    def test_runtime_error_cannot_be_rearmed_by_checkpoint_reload(self):
+    def test_policy_transport_error_allows_explicit_reload_after_confirmed_stop(self):
         class RuntimeErrorPolicy(CountPolicy):
             def infer(self, observation, instruction):
                 raise RuntimeError("Prediction transport failed")
@@ -556,8 +559,13 @@ class CheckpointReload(unittest.TestCase):
         self.wait(lambda: old.shutdown_complete)
         self.assertEqual(old.state, "ERROR")
         self.assertTrue(old.replacement_closed)
-        self.assertFalse(old.can_replace)
-        self.assertFalse(self.app.load_checkpoint())
+        self.assertTrue(old.can_replace)
+        self.assertEqual(old.results[0]["outcome"], "failure")
+        self.assertTrue(self.app.load_checkpoint())
+        self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
+                  and not self.app._reload_in_progress)
+        self.assertEqual(self.app.session.embodiment.home_count, 0)
+        self.assertEqual(self.app.session.embodiment.applied, [])
 
 
 if __name__ == "__main__":

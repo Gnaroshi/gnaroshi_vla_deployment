@@ -10,7 +10,7 @@ import threading
 import time
 import importlib.metadata
 import numpy as np
-from ..contracts import Observation, RobotActionError, RobotRecoveryRequired, action_vector
+from ..contracts import CameraError, Observation, RobotActionError, RobotRecoveryRequired, action_vector
 
 
 @dataclass
@@ -20,6 +20,10 @@ class UR5eConfig:
     camera_fps: int = 30
     width: int = 640
     height: int = 480
+    camera_wait_timeout_ms: int = 1000
+    camera_connect_timeout_s: float = 10.0
+    camera_scan_timeout_s: float = 5.0
+    max_camera_frame_age_s: float = 1.0
     home_joints: tuple = ()
     home_duration_s: float = 3.0
     home_hz: int = 10
@@ -43,10 +47,14 @@ class UR5eConfig:
     def validate(self):
         if not isinstance(self.robot_ip,str) or not self.robot_ip.strip():
             raise ValueError("Robot address must be supplied by the owning project")
-        if set(self.camera_serials)!={"primary","wrist"} or any(not v for v in self.camera_serials.values()):
+        if set(self.camera_serials)!={"primary","wrist"} or any(not isinstance(v,str) or not v.strip() or v!=v.strip() for v in self.camera_serials.values()):
             raise ValueError("Both primary and wrist camera serials must be explicit")
         if len(set(self.camera_serials.values()))!=2:
             raise ValueError("Primary and wrist must be different cameras")
+        if any(type(value) is not int or value<1 for value in (self.width,self.height,self.camera_fps,self.camera_wait_timeout_ms)):
+            raise ValueError("Camera resolution, FPS and frame deadline must be positive integers")
+        if self.camera_wait_timeout_ms>10000 or any(not np.isfinite(value) or value<=0 for value in (self.camera_connect_timeout_s,self.camera_scan_timeout_s,self.max_camera_frame_age_s)):
+            raise ValueError("Camera deadlines must be finite and positive; frame deadline is at most10000ms")
         if not 0<=self.release_threshold<self.close_threshold<=1:
             raise ValueError("Invalid gripper hysteresis thresholds")
         if len(self.home_joints)!=6 or not np.isfinite(self.home_joints).all():
@@ -135,6 +143,13 @@ class UR5eEmbodiment:
         self.command_lock=threading.Lock()
         self.control=self.receive=self.gripper=None
         self.cameras={}
+        self._camera_frames={}
+        self._camera_open_job=None
+        self._camera_scan_job=None
+        self._camera_open_lock=threading.RLock()
+        self.metadata["camera_configuration"]={"width":config.width,"height":config.height,"fps":config.camera_fps,
+            "format":"rgb8","wait_timeout_ms":config.camera_wait_timeout_ms,
+            "max_frame_age_s":config.max_camera_frame_age_s,"scan_timeout_s":config.camera_scan_timeout_s}
         self.commanded=None
         self.steps=0
         self.gripper_status="open"
@@ -421,23 +436,244 @@ class UR5eEmbodiment:
             with self._recovery_guard:
                 self._recovery_call_active=False
 
-    def connect_preview(self):
-        """Open RGB cameras only; never import/connect robot or gripper drivers."""
+    @property
+    def camera_operation_pending(self):
+        with self._camera_open_lock:
+            return any(job is not None and not job["done"].is_set()
+                       for job in (self._camera_open_job,self._camera_scan_job))
+
+    def list_camera_devices(self):
+        """Explicit identity/profile scan; never start a stream or robot control."""
+        with self._camera_open_lock:
+            if self.camera_operation_pending:
+                raise CameraError("A camera driver operation is still finishing",category="camera_operation_pending")
+            job={"done":threading.Event(),"abandoned":threading.Event(),"result":None,"error":None}
+            self._camera_scan_job=job
+        def scan():
+            report,error=None,None
+            try:
+                report=self._camera_device_report()
+            except Exception as caught:
+                # Do not retain SDK objects through a native exception traceback.
+                error=CameraError(str(caught),category=getattr(caught,"category","camera_discovery_failed"),
+                                  status=getattr(caught,"status",{}))
+            finally:
+                with self._camera_open_lock:
+                    if not job["abandoned"].is_set():
+                        job.update(result=report,error=error)
+                    job["done"].set()
+        threading.Thread(target=scan,name="camera-discovery",daemon=True).start()
+        if not job["done"].wait(self.config.camera_scan_timeout_s):
+            with self._camera_open_lock:
+                job["abandoned"].set()
+            raise CameraError("Camera discovery timed out; wait for the driver before retrying",
+                              category="camera_scan_timeout",status={"native_pending":self.camera_operation_pending})
+        if job["error"] is not None:
+            raise job["error"]
+        if job["result"] is None:
+            raise CameraError("Camera discovery was cancelled",category="camera_scan_cancelled")
+        return job["result"]
+
+    def _camera_device_report(self):
         import pyrealsense2 as rs
-        self.rs=rs
+        devices, warnings = [], []
         try:
-            for role,serial in self.config.camera_serials.items():
-                if role in self.cameras:
-                    continue
-                pipeline=rs.pipeline()
-                cfg=rs.config()
-                cfg.enable_device(serial)
-                cfg.enable_stream(rs.stream.color,self.config.width,self.config.height,rs.format.rgb8,self.config.camera_fps)
-                self.cameras[role]=pipeline
-                pipeline.start(cfg)
-        except BaseException:
-            self.close()
-            raise
+            connected = list(rs.context().query_devices())
+        except Exception as error:
+            raise CameraError(f"Camera discovery failed: {error}", category="camera_discovery_failed") from error
+        for device in connected:
+            def info(key):
+                try:
+                    return str(device.get_info(getattr(rs.camera_info, key)))
+                except Exception:
+                    return ""
+            serial, name = info("serial_number"), info("name")
+            if not serial:
+                warnings.append("A connected camera did not expose a serial number")
+                continue
+            profiles = set()
+            try:
+                for sensor in device.query_sensors():
+                    for profile in sensor.get_stream_profiles():
+                        if profile.stream_type() != rs.stream.color or profile.format() != rs.format.rgb8:
+                            continue
+                        video = profile.as_video_stream_profile()
+                        profiles.add((video.width(), video.height(), profile.fps(), "rgb8"))
+            except Exception as error:
+                warnings.append(f"Could not inspect color profiles for {serial}: {error}")
+            devices.append({"serial":serial,"name":name,"label":f"{name or 'Camera'} [{serial}]",
+                            "firmware":info("firmware_version"),"usb_type":info("usb_type_descriptor"),
+                            "color_profiles":[dict(zip(("width","height","fps","format"), values))
+                                              for values in sorted(profiles)]})
+        return {"devices":sorted(devices,key=lambda item:item["serial"]),
+                "selected":dict(self.config.camera_serials),
+                "configuration":dict(self.metadata["camera_configuration"]),"warnings":warnings}
+
+    @staticmethod
+    def _stop_camera_pipelines(pipelines):
+        errors = []
+        for role, pipeline in pipelines.items():
+            try:
+                pipeline.stop()
+            except Exception as error:
+                errors.append(f"{role}: {error}")
+        return errors
+
+    def _abandon_camera_operations(self):
+        """A late native start retains ownership and closes its own pipelines."""
+        cleanup = {}
+        with self._camera_open_lock:
+            scan = self._camera_scan_job
+            if scan is not None:
+                scan["abandoned"].set()
+            job = self._camera_open_job
+            if job is None:
+                return scan is not None and not scan["done"].is_set()
+            job["abandoned"].set()
+            if job["done"].is_set():
+                cleanup, job["result"] = job["result"], {}
+            pending = not job["done"].is_set() or (scan is not None and not scan["done"].is_set())
+        self._stop_camera_pipelines(cleanup)
+        return pending
+
+    def _close_camera_streams(self):
+        pending = self._abandon_camera_operations()
+        if pending:
+            raise CameraError("Camera driver operation is still finishing; retry after it closes",
+                              category="camera_operation_pending",status={"native_pending":True})
+        previous, self.cameras = self.cameras, {}
+        self._camera_frames.clear()
+        errors = self._stop_camera_pipelines(previous)
+        if errors:
+            raise CameraError("Camera stop failed",category="camera_stop_failed",status={"errors":errors})
+
+    def connect_preview(self, cancel=None):
+        """Open RGB only, with finite caller wait and ownership of late starts."""
+        if self.camera_operation_pending:
+            raise CameraError("A camera driver operation is still finishing",category="camera_operation_pending")
+        if set(self.cameras) == set(self.config.camera_serials):
+            return
+        if self.cameras:
+            self._close_camera_streams()
+        import pyrealsense2 as rs
+        cancel = cancel or threading.Event()
+        with self._camera_open_lock:
+            if self._camera_open_job is not None and not self._camera_open_job["done"].is_set():
+                raise CameraError("A previous camera driver operation is still finishing",
+                                  category="camera_operation_pending",status={"native_pending":True})
+            job = {"done":threading.Event(),"abandoned":threading.Event(),"result":{},"error":None}
+            self._camera_open_job = job
+        serials = dict(self.config.camera_serials)
+        cfg_values = (self.config.width,self.config.height,self.config.camera_fps)
+        def open_streams():
+            opened, error = {}, None
+            try:
+                for role, serial in serials.items():
+                    if job["abandoned"].is_set() or cancel.is_set():
+                        raise InterruptedError("Camera connection cancelled")
+                    pipeline = rs.pipeline()
+                    # Even a start that raises can have allocated USB resources.
+                    opened[role] = pipeline
+                    cfg = rs.config()
+                    cfg.enable_device(serial)
+                    cfg.enable_stream(rs.stream.color,*cfg_values[:2],rs.format.rgb8,cfg_values[2])
+                    pipeline.start(cfg)
+            except BaseException as caught:
+                error = caught
+            with self._camera_open_lock:
+                job["error"] = error
+                cleanup = opened if error is not None or job["abandoned"].is_set() or cancel.is_set() else {}
+                job["result"] = {} if cleanup else opened
+            self._stop_camera_pipelines(cleanup)
+            # Mark completion atomically with the final abandonment check. No
+            # stop may race a still-running pipeline.start on its native handle.
+            with self._camera_open_lock:
+                cleanup = job["result"] if job["abandoned"].is_set() or cancel.is_set() else {}
+                if cleanup:
+                    job["result"] = {}
+                else:
+                    job["done"].set()
+            if cleanup:
+                self._stop_camera_pipelines(cleanup)
+                job["done"].set()
+        threading.Thread(target=open_streams,name="camera-connect",daemon=True).start()
+        deadline = time.monotonic()+self.config.camera_connect_timeout_s
+        while not job["done"].wait(.02):
+            if cancel.is_set() or time.monotonic()>=deadline:
+                self._abandon_camera_operations()
+                if cancel.is_set():
+                    raise InterruptedError("Camera connection cancelled")
+                raise CameraError("Camera connection timed out; the driver will close late streams",
+                                  category="camera_connect_timeout",status={"native_pending":self.camera_operation_pending})
+        if cancel.is_set():
+            self._abandon_camera_operations()
+            raise InterruptedError("Camera connection cancelled")
+        with self._camera_open_lock:
+            if job["error"] is not None:
+                raise CameraError(f"Camera connection failed: {job['error']}",category="camera_connect_failed",
+                                  status={"selected":serials}) from job["error"]
+            self.cameras, job["result"] = job["result"], {}
+        self._camera_frames.clear()
+        if set(self.cameras)!=set(serials):
+            raise CameraError("Camera connection was cancelled before ownership transfer",category="camera_connect_cancelled")
+
+    def configure_cameras(self, serials, cancel):
+        """Change sensor roles while idle, preserving controls and gripper state."""
+        if self.armed.is_set():
+            raise ValueError("Stop the active rollout before changing cameras")
+        if cancel.is_set():
+            raise InterruptedError("Camera change cancelled")
+        if not isinstance(serials,dict) or set(serials)!=set(self.config.camera_serials):
+            raise ValueError("Camera mapping must supply every configured role exactly once")
+        if any(not isinstance(value,str) or not value.strip() or value!=value.strip() for value in serials.values()):
+            raise ValueError("Each camera role requires an explicit serial number")
+        if len(set(serials.values()))!=len(serials):
+            raise ValueError("Camera roles must use distinct devices")
+        if self.camera_operation_pending:
+            raise CameraError("A camera driver operation is still finishing",category="camera_operation_pending")
+        scan = self.list_camera_devices()
+        available = {item["serial"]:item for item in scan["devices"]}
+        for role, serial in serials.items():
+            if serial not in available:
+                raise CameraError(f"Selected {role} camera is not connected: {serial}",
+                                  category="camera_not_found",status={"role":role,"serial":serial})
+            profiles = available[serial]["color_profiles"]
+            if profiles and not any(p["width"]==self.config.width and p["height"]==self.config.height
+                                    and p["fps"]==self.config.camera_fps and p["format"]=="rgb8" for p in profiles):
+                raise CameraError(f"Selected {role} camera does not support the configured RGB profile",
+                                  category="camera_profile_unsupported",status={"role":role,"serial":serial,
+                                  "requested":self.metadata["camera_configuration"]})
+        previous = dict(self.config.camera_serials)
+        self._close_camera_streams()
+        self.config.camera_serials = dict(serials)
+        try:
+            self.connect_preview(cancel)
+            _, camera_metadata = self._images()
+            if cancel.is_set():
+                raise InterruptedError("Camera change cancelled")
+        except BaseException as error:
+            rollback = False
+            rollback_error = None
+            try:
+                self._close_camera_streams()
+                self.config.camera_serials = previous
+                if not cancel.is_set():
+                    self.connect_preview(cancel)
+                    self._images()
+                    rollback = True
+            except Exception as caught:
+                rollback_error = str(caught)
+            self.config.camera_serials = previous
+            self.metadata["camera_serials"] = previous
+            if isinstance(error,InterruptedError):
+                raise
+            raise CameraError(f"Camera change failed: {error}",category=getattr(error,"category","camera_change_failed"),
+                              status={"requested":dict(serials),"previous":previous,"rollback_restored":rollback,
+                                      "rollback_error":rollback_error,"native_pending":self.camera_operation_pending}) from error
+        self.metadata["camera_serials"] = dict(serials)
+        self.metadata["camera_metadata"] = camera_metadata
+        return {"selected":dict(serials),"configuration":dict(self.metadata["camera_configuration"]),
+                "camera_metadata":camera_metadata}
 
     def connect(self):
         self.connect_preview()
@@ -486,14 +722,64 @@ class UR5eEmbodiment:
             raise self._driver_failure("Robot state feedback failed",{},category="state_feedback_error",error=error) from error
 
     def _images(self):
+        if set(self.cameras)!=set(self.config.camera_serials):
+            raise CameraError("Camera streams are not connected for every configured role",
+                              category="camera_not_connected",status={"selected":dict(self.config.camera_serials),
+                              "connected_roles":sorted(self.cameras),"native_pending":self.camera_operation_pending})
         images,metadata={},{}
         for role,pipeline in self.cameras.items():
-            frame=pipeline.wait_for_frames(timeout_ms=1000).get_color_frame()
-            if not frame:
-                raise RuntimeError(f"Missing {role} camera RGB frame")
-            images[role]=np.asanyarray(frame.get_data()).copy()
-            metadata[role]={"serial":self.config.camera_serials[role],"frame_number":frame.get_frame_number(),
-                            "device_timestamp_ms":frame.get_timestamp(),"timestamp_domain":str(frame.get_frame_timestamp_domain())}
+            deadline=time.monotonic()+self.config.camera_wait_timeout_ms/1000
+            while True:
+                remaining=deadline-time.monotonic()
+                if remaining<=0:
+                    raise CameraError(f"No fresh RGB frame from {role} camera before its deadline",
+                                      category="camera_frame_timeout",status={"role":role,
+                                      "serial":self.config.camera_serials[role],"previous_frame":self._camera_frames.get(role)})
+                try:
+                    frame=pipeline.wait_for_frames(timeout_ms=max(1,int(remaining*1000))).get_color_frame()
+                except Exception as error:
+                    raise CameraError(f"RGB capture failed for {role}: {error}",category="camera_capture_failed",
+                                      status={"role":role,"serial":self.config.camera_serials[role]}) from error
+                if not frame:
+                    continue
+                try:
+                    number=int(frame.get_frame_number())
+                    timestamp=float(frame.get_timestamp())
+                    domain=str(frame.get_frame_timestamp_domain())
+                except Exception as error:
+                    raise CameraError(f"Invalid {role} camera frame metadata: {error}",
+                                      category="camera_frame_invalid",status={"role":role}) from error
+                if number<0 or not np.isfinite(timestamp):
+                    raise CameraError(f"Invalid {role} camera timestamp or frame number",
+                                      category="camera_frame_invalid",status={"role":role})
+                if number<=self._camera_frames.get(role,-1):
+                    continue
+                received_ns=time.time_ns()
+                age_s=None
+                if domain.rsplit(".",1)[-1] in {"global_time","system_time"}:
+                    age_s=received_ns/1e9-timestamp/1000
+                    if age_s>self.config.max_camera_frame_age_s or age_s < -self.config.max_camera_frame_age_s:
+                        raise CameraError(f"Stale or clock-inconsistent {role} camera frame",
+                                          category="camera_stale_frame",status={"role":role,"frame_age_s":age_s,
+                                          "timestamp_domain":domain,"frame_number":number})
+                try:
+                    image=np.asanyarray(frame.get_data())
+                except Exception as error:
+                    raise CameraError(f"Cannot read {role} RGB pixels: {error}",category="camera_frame_invalid",
+                                      status={"role":role}) from error
+                expected=(self.config.height,self.config.width,3)
+                if image.dtype!=np.uint8 or image.shape!=expected:
+                    raise CameraError(f"Unexpected {role} RGB shape/type: {image.shape}, {image.dtype}",
+                                      category="camera_profile_mismatch",status={"role":role,"expected_shape":list(expected),
+                                      "actual_shape":list(image.shape),"actual_dtype":str(image.dtype)})
+                images[role]=image.copy()
+                self._camera_frames[role]=number
+                metadata[role]={"serial":self.config.camera_serials[role],"frame_number":number,
+                                "device_timestamp_ms":timestamp,"timestamp_domain":domain,
+                                "host_received_ns":received_ns,"host_received_monotonic_ns":time.monotonic_ns(),
+                                "frame_age_s":age_s}
+                break
+        self.metadata["camera_metadata"]=metadata
         return images, metadata
 
     def observe_preview(self):
@@ -728,6 +1014,7 @@ class UR5eEmbodiment:
             self.command_lock.release()
 
     def close(self):
+        camera_pending=self._abandon_camera_operations()
         if self.recovery_pending:
             # Native C++ calls are not thread-safe against disconnect. Preserve
             # RTDE handles and report incomplete cleanup instead of racing them.
@@ -764,3 +1051,7 @@ class UR5eEmbodiment:
                     pass
             self.control=self.receive=self.gripper=None
             self._control_no_upload=False
+            self._camera_frames.clear()
+            if camera_pending:
+                raise CameraError("Camera connection cleanup is still pending in its native driver",
+                                  category="camera_operation_pending",status={"native_pending":True})

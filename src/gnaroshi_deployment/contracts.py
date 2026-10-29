@@ -47,6 +47,17 @@ class RobotActionError(ValueError):
         return {"category": self.category, "message": str(self), "status": self.status}
 
 
+class CameraError(RuntimeError):
+    """A camera fault; camera recovery never authorizes robot recovery or motion."""
+    def __init__(self, reason: str, *, status: dict | None = None, category: str = "camera_error"):
+        super().__init__(reason)
+        self.category = category
+        self.status = _failure_value(dict(status or {}))
+
+    def asdict(self):
+        return {"category": self.category, "message": str(self), "status": self.status}
+
+
 @dataclass
 class Observation:
     images: dict[str, np.ndarray]
@@ -120,6 +131,14 @@ class Embodiment(Protocol):
     returning {"healthy": True, "stop_confirmed": True, ...}. It never unlocks,
     powers on, releases brakes, homes, activates the gripper or arms motion.
     Only RobotRecoveryRequired faults enable this explicit recovery path.
+
+    Optional list_camera_devices() enumerates identities/capabilities without
+    opening streams or robot controls. It returns {devices, selected,
+    configuration, warnings}. Optional configure_cameras(serials, cancel)
+    changes only sensors while the worker is idle and motion is stopped. It
+    returns {selected, configuration, camera_metadata}; failures raise CameraError
+    and disclose whether the previous selection was restored. The session owns
+    policy-buffer reset and configuration/result provenance after a change.
     """
     metadata: dict
     def connect(self) -> None: ...

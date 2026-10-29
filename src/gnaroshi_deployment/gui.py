@@ -2,9 +2,14 @@
 from __future__ import annotations
 import copy
 import json
+import math
 from pathlib import Path
 import queue
+import shutil
+import subprocess
+import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -59,6 +64,15 @@ class DeploymentGUI:
         self._failure_notes_seen = None
         self._event_detail = ""
         self._load_error_detail = None
+        self._last_save_error = None
+        self._annotation_job = None
+        self._annotation_drafts = {}
+        self._annotation_original = ""
+        self._utility_events = queue.Queue()
+        self._help_window = None
+        self._camera_draft_dirty = False
+        self._camera_actual_seen = self._camera_mapping()
+        self.camera_title_vars = {}
         root.title(f"{session.config.method} | {session.config.task} deployment")
         root.geometry("1440x960")
         root.minsize(1100, 780)
@@ -80,10 +94,15 @@ class DeploymentGUI:
         if self.reload_fields:
             self.checkpoint_toggle = ttk.Button(heading, text="Task / checkpoint...", command=self.toggle_checkpoint_panel)
             self.checkpoint_toggle.grid(row=0, column=2, padx=(0, SPACE["control"]))
+        self.help_button = ttk.Button(heading, text="Help [F1]", command=self.show_help)
+        self.help_button.grid(row=0, column=3 if self.reload_fields else 2, padx=(0, SPACE["control"]))
         self.exit_button = ttk.Button(heading, text="Exit", command=self.close)
-        self.exit_button.grid(row=0, column=3 if self.reload_fields else 2)
+        self.exit_button.grid(row=0, column=4 if self.reload_fields else 3)
         self.instruction_label = ttk.Label(heading, text=session.config.instruction, wraplength=1000, style="Muted.TLabel")
-        self.instruction_label.grid(row=1, column=0, columnspan=4 if self.reload_fields else 3, sticky="w", pady=(SPACE["control"], 0))
+        self.instruction_label.grid(row=1, column=0, columnspan=5 if self.reload_fields else 4, sticky="w", pady=(SPACE["control"], 0))
+        self.active_identity = tk.StringVar(value="Waiting for the selected policy")
+        ttk.Label(heading, textvariable=self.active_identity, style="Muted.TLabel", wraplength=1100).grid(
+            row=2, column=0, columnspan=5 if self.reload_fields else 4, sticky="w", pady=(SPACE["small"], 0))
         body = ttk.Frame(root, padding=(SPACE["section"], 0, SPACE["section"], SPACE["control"]))
         body.grid(row=1, sticky="nsew")
         body.columnconfigure(0, weight=1)
@@ -126,13 +145,21 @@ class DeploymentGUI:
         metrics.grid(row=1, sticky="ew", pady=SPACE["group"])
         ttk.Label(metrics, textvariable=self.metrics, justify="left").pack(anchor="w")
         ttk.Label(side, textvariable=self.counts, wraplength=390, style="Muted.TLabel").grid(row=2, sticky="ew", pady=(0, SPACE["control"]))
-        tabs = ttk.Notebook(side)
+        tabs = self.tabs = ttk.Notebook(side)
         tabs.grid(row=3, sticky="nsew")
-        results, notes, settings, details = (ttk.Frame(tabs, padding=SPACE["control"]) for _ in range(4))
-        for frame, title in ((results, "Rollouts"), (notes, "Notes"), (settings, "Settings"), (details, "Details")):
-            tabs.add(frame, text=title)
+        frames, tab_frames = {}, {}
+        for title in ("Rollouts", "Notes", "Devices", "Settings", "Details"):
+            if title in {"Rollouts", "Devices", "Settings"}:
+                outer = ttk.Frame(tabs)
+                inner = self._scrollable_content(outer)
+            else:
+                outer = inner = ttk.Frame(tabs, padding=SPACE["control"])
+            tabs.add(outer, text=title)
+            frames[title], tab_frames[title] = inner, outer
+        results, notes, devices, settings, details = (frames[title] for title in ("Rollouts", "Notes", "Devices", "Settings", "Details"))
+        self.devices_tab = tab_frames["Devices"]
         results.columnconfigure(0, weight=1)
-        results.rowconfigure(0, weight=1)
+        results.rowconfigure(0, weight=1, minsize=120)
         self.table = ttk.Treeview(results, columns=("run", "result", "steps", "hz", "reason"), show="headings", height=5, selectmode="browse")
         for column, title, width in (("run", "Run", 40), ("result", "Outcome", 70), ("steps", "Steps", 48), ("hz", "Hz", 48), ("reason", "Reason", 160)):
             self.table.heading(column, text=title)
@@ -142,6 +169,33 @@ class DeploymentGUI:
         self.table.grid(row=0, column=0, sticky="nsew")
         self.table.bind("<<TreeviewSelect>>", self.show_result_note)
         ttk.Label(results, textvariable=self.failure_note, wraplength=370, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
+        self.result_summary = tk.StringVar(value="")
+        ttk.Label(results, textvariable=self.result_summary, wraplength=370, style="Muted.TLabel").grid(row=2, sticky="ew", pady=(SPACE["small"], 0))
+        result_actions = ttk.Frame(results)
+        result_actions.grid(row=3, sticky="ew", pady=(SPACE["control"], 0))
+        self.open_result_button = ttk.Button(result_actions, text="Open folder", command=self.open_result_folder)
+        self.open_result_button.pack(side="left")
+        self.copy_result_button = ttk.Button(result_actions, text="Copy path", command=self.copy_result_path)
+        self.copy_result_button.pack(side="left", padx=SPACE["small"])
+        video_actions = ttk.Frame(results)
+        video_actions.grid(row=4, sticky="ew", pady=(SPACE["small"], 0))
+        self.video_role = tk.StringVar(value=session.config.camera_roles[0])
+        self.video_role_selector = ttk.Combobox(video_actions, textvariable=self.video_role, values=session.config.camera_roles, state="readonly", width=10)
+        self.video_role_selector.pack(side="left")
+        self.open_video_button = ttk.Button(video_actions, text="Open video", command=self.open_result_video)
+        self.open_video_button.pack(side="left", padx=SPACE["small"])
+        annotation = ttk.Frame(results)
+        annotation.grid(row=5, sticky="ew", pady=(SPACE["control"], 0))
+        annotation.columnconfigure(0, weight=1)
+        ttk.Label(annotation, text="Selected rollout annotation", style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.result_annotation = tk.StringVar(value="")
+        self.annotation_entry = ttk.Entry(annotation, textvariable=self.result_annotation)
+        self.annotation_entry.grid(row=1, column=0, sticky="ew", pady=(SPACE["small"], 0))
+        self.annotation_entry.bind("<KeyRelease>", self.schedule_annotation)
+        self.annotation_button = ttk.Button(annotation, text="Save", command=self.save_result_annotation)
+        self.annotation_button.grid(row=1, column=1, padx=(SPACE["small"], 0), pady=(SPACE["small"], 0))
+        self._annotation_result_id = None
+        self._devices_panel(devices)
         notes.columnconfigure(0, weight=1)
         notes.rowconfigure(1, weight=1)
         ttk.Label(notes, text="Experiment notes · saved automatically", style="Muted.TLabel").grid(row=0, sticky="w", pady=(0, SPACE["small"]))
@@ -163,7 +217,13 @@ class DeploymentGUI:
         self.steps_entry = ttk.Entry(settings, textvariable=self.steps, width=12)
         self.steps_entry.grid(row=2, column=1, sticky="ew", padx=(SPACE["control"], 0))
         self.apply_button = ttk.Button(settings, text="Apply settings", command=self.apply_settings, state="disabled")
-        self.apply_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(SPACE["control"], 0))
+        self.apply_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(SPACE["control"], 0))
+        self.record_video = tk.BooleanVar(value=session.config.record_video)
+        self.record_video_toggle = ttk.Checkbutton(settings, text="Record rollout videos", variable=self.record_video)
+        self.record_video_toggle.grid(row=3, column=0, columnspan=2, sticky="w", pady=(SPACE["control"], 0))
+        self.health = tk.StringVar(value="Waiting for device and storage status")
+        ttk.Label(settings, text="Storage / recording / cameras", style="Muted.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(SPACE["section"], SPACE["small"]))
+        ttk.Label(settings, textvariable=self.health, wraplength=340, justify="left").grid(row=6, column=0, columnspan=2, sticky="ew")
         self.details = tk.Text(details, wrap="word", width=24, height=6, **self._text_style())
         self.details.pack(fill="both", expand=True)
         # Paths/provenance stay in the explicit Details tab, rather than the
@@ -185,6 +245,231 @@ class DeploymentGUI:
         self._details_seen = None
         session.start()
         root.after(80, self.refresh)
+
+    def _scrollable_content(self, parent, *, height=None):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(parent, background=THEME["canvas"], highlightthickness=0,
+                           width=1, height=height if height is not None else 1)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        inner = ttk.Frame(canvas, padding=SPACE["control"])
+        window = canvas.create_window(0, 0, anchor="nw", window=inner)
+        inner.bind("<Configure>", lambda _event:canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event:canvas.itemconfigure(window, width=max(1,event.width)))
+        # Use the visible scrollbar rather than global wheel bindings that can
+        # steal scrolling from notes or accidentally change a camera combobox.
+        inner.scroll_canvas = canvas
+        return inner
+
+    def _devices_panel(self, parent):
+        parent.columnconfigure(1, weight=1)
+        self.device_hint = tk.StringVar(value="Refresh lists connected cameras; it does not start a policy or move the robot.")
+        ttk.Label(parent, textvariable=self.device_hint, wraplength=370, style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, SPACE["control"]))
+        self.scan_devices_button = ttk.Button(parent, text="Refresh connected cameras", command=self.refresh_devices)
+        self.scan_devices_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, SPACE["group"]))
+        self.camera_vars, self.camera_selectors, self.camera_device_names = {}, {}, {}
+        mapping = self._camera_mapping()
+        for row, role in enumerate(self.session.config.camera_roles, start=2):
+            ttk.Label(parent, text=role.title()).grid(row=row*2, column=0, sticky="w", padx=(0, SPACE["control"]))
+            variable = tk.StringVar(value=str(mapping.get(role, "")))
+            selector = ttk.Combobox(parent, textvariable=variable, values=[variable.get()] if variable.get() else (), state="readonly", width=18)
+            selector.grid(row=row*2, column=1, sticky="ew")
+            selector.bind("<<ComboboxSelected>>", self._camera_draft_changed)
+            self.camera_vars[role], self.camera_selectors[role] = variable, selector
+            self.camera_device_names[role] = tk.StringVar(value="Current assignment")
+            ttk.Label(parent, textvariable=self.camera_device_names[role], style="Muted.TLabel", wraplength=280).grid(row=row*2+1, column=1, sticky="w", pady=(0, SPACE["control"]))
+        row = 4 + 2*len(self.camera_vars)
+        actions = ttk.Frame(parent)
+        actions.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(SPACE["small"], 0))
+        self.swap_cameras_button = ttk.Button(actions, text="Swap roles" if len(self.camera_vars)==2 else "Swap first two roles", command=self.swap_camera_roles)
+        self.swap_cameras_button.pack(side="left")
+        self.apply_cameras_button = ttk.Button(actions, text="Apply cameras", command=self.apply_cameras)
+        self.apply_cameras_button.pack(side="right")
+        self.reconnect_cameras_button = ttk.Button(parent, text="Restart camera preview", command=self.restart_cameras)
+        self.reconnect_cameras_button.grid(row=row+1, column=0, columnspan=2, sticky="ew", pady=(SPACE["control"], 0))
+        self.camera_health = tk.StringVar(value="No camera observations yet")
+        ttk.Label(parent, textvariable=self.camera_health, wraplength=370, justify="left").grid(row=row+2, column=0, columnspan=2, sticky="ew", pady=(SPACE["group"], 0))
+        ttk.Label(parent, text="Camera changes preserve the loaded policy. Apply only while idle; Start is always a separate action.", style="Muted.TLabel", wraplength=370).grid(row=row+3, column=0, columnspan=2, sticky="ew", pady=(SPACE["control"], 0))
+
+    def _camera_mapping(self):
+        metadata = getattr(self.session.embodiment, "metadata", {})
+        mapping = metadata.get("camera_serials", {}) if isinstance(metadata, dict) else {}
+        return {role:str(mapping.get(role, "")) for role in self.session.config.camera_roles}
+
+    def _camera_draft_changed(self, _event=None):
+        self._camera_draft_dirty = True
+        self.device_hint.set("Camera selection is a draft. Apply cameras to change the live streams.")
+
+    def refresh_devices(self):
+        if self.closing or self._reload_in_progress:
+            return False
+        operation = getattr(self.session, "request_device_scan", None)
+        try:
+            if callable(operation) and operation():
+                self.device_hint.set("Listing connected camera identities...")
+                return True
+            self.device_hint.set("Camera discovery is unavailable or busy. Wait until the current operation ends.")
+        except Exception as error:
+            self.device_hint.set(f"Camera discovery failed: {error}")
+        return False
+
+    def swap_camera_roles(self):
+        if self.closing or self._reload_in_progress or len(self.camera_vars)<2:
+            return False
+        status = getattr(self.session, "device_status", {})
+        if not status.get("can_apply", False):
+            return False
+        left, right = list(self.camera_vars.values())[:2]
+        first, second = left.get(), right.get()
+        left.set(second)
+        right.set(first)
+        self._camera_draft_changed()
+        return True
+
+    def apply_cameras(self):
+        if self.closing or self._reload_in_progress:
+            return False
+        mapping = {role:variable.get().strip() for role,variable in self.camera_vars.items()}
+        if not all(mapping.values()) or len(set(mapping.values())) != len(mapping):
+            self.device_hint.set("Choose a different camera for every configured role.")
+            return False
+        operation = getattr(self.session, "request_camera_update", None)
+        try:
+            if callable(operation) and operation(mapping):
+                self._camera_draft_dirty = True
+                self.device_hint.set("Applying camera assignments. Policy remains loaded; no motion is requested.")
+                return True
+            self.device_hint.set("Camera changes require an idle session and acknowledged stop.")
+        except Exception as error:
+            self.device_hint.set(f"Camera change failed: {error}")
+        return False
+
+    def restart_cameras(self):
+        if self.closing or self._reload_in_progress:
+            return False
+        operation = getattr(self.session, "request_camera_reconnect", None)
+        try:
+            if callable(operation) and operation():
+                self.device_hint.set("Restarting the current camera streams; loaded policy is preserved.")
+                return True
+            self.device_hint.set("Camera restart is unavailable while another operation is active.")
+        except Exception as error:
+            self.device_hint.set(f"Camera restart failed: {error}")
+        return False
+
+    def _sync_camera_selection(self, mapping):
+        if not self.reload_fields:
+            return
+        selected = self.current_selection()
+        selected["camera_serials"] = dict(mapping)
+        for role, serial in mapping.items():
+            if f"{role}_serial" in selected:
+                selected[f"{role}_serial"] = serial
+        selected.setdefault("resolved_config", {}).setdefault("robot", {})["camera_serials"] = dict(mapping)
+        try:
+            if self.selection_resolver:
+                selected = self.selection_resolver(selected, "devices")
+            self._apply_selection(selected)
+        except Exception as error:
+            # The camera transaction already succeeded. Keep its actual identity
+            # even if a project-specific draft cannot currently be resolved.
+            self._apply_selection(selected)
+            self.session.record_event("camera_selection_sync_error", detail=str(error))
+            self.device_hint.set("Cameras changed. Check the selected task before saving its configuration.")
+
+    @staticmethod
+    def _finite_number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    def _update_device_status(self, latest):
+        status = getattr(self.session, "device_status", {})
+        status = status if isinstance(status, dict) else {}
+        active = self.closing or self._reload_in_progress or status.get("busy")
+        can_apply = not active and status.get("can_apply", False)
+        can_scan = not active and not status.get("scan_busy") and status.get("can_scan", False)
+        self.scan_devices_button.configure(text="Listing cameras..." if status.get("scan_busy") else "Refresh connected cameras", state="normal" if can_scan else "disabled")
+        self.apply_cameras_button.configure(state="normal" if can_apply else "disabled")
+        self.reconnect_cameras_button.configure(state="normal" if can_apply else "disabled")
+        self.swap_cameras_button.configure(state="normal" if can_apply and len(self.camera_vars)>1 else "disabled")
+        devices = status.get("devices", [])
+        devices = [row for row in devices if isinstance(row, dict) and row.get("serial")]
+        names = {str(row["serial"]):str(row.get("name") or row.get("label") or "Camera") for row in devices}
+        actual = status.get("selected") or self._camera_mapping()
+        actual = {role:str(actual.get(role, "")) for role in self.camera_vars}
+        changed = self._camera_actual_seen is not None and actual != self._camera_actual_seen
+        if changed or self._camera_actual_seen is None:
+            if changed or not self._camera_draft_dirty:
+                for role, value in actual.items():
+                    self.camera_vars[role].set(value)
+                self._camera_draft_dirty = False
+            if changed:
+                self._sync_camera_selection(actual)
+                self.device_hint.set("Camera assignments applied. The loaded policy is unchanged.")
+            self._camera_actual_seen = dict(actual)
+        for role, selector in self.camera_selectors.items():
+            selected = self.camera_vars[role].get()
+            values = sorted(set(names) | {serial for serial in actual.values() if serial} | ({selected} if selected else set()))
+            selector.configure(values=values, state="readonly" if can_apply else "disabled")
+            current = actual.get(role, "")
+            name = names.get(selected, "Current camera" if selected==current else "Not in the refreshed device list")
+            suffix = " · live" if selected==current else " · draft"
+            self.camera_device_names[role].set(name + suffix)
+        if status.get("error"):
+            self.device_hint.set(f"Camera operation failed: {status['error']}")
+        elif status.get("warnings"):
+            self.device_hint.set("; ".join(map(str,status["warnings"])))
+        elif not status.get("supported", bool(status)):
+            self.device_hint.set("This embodiment does not expose camera selection. Existing streams remain available.")
+        health = getattr(self.session, "operator_health", {})
+        health = health if isinstance(health, dict) else {}
+        camera_health = health.get("cameras", {})
+        rows = []
+        capture_age = None
+        if latest is not None and latest.captured_monotonic_ns is not None:
+            capture_age = max(0, (time.monotonic_ns()-latest.captured_monotonic_ns)/1e6)
+        for role in self.camera_vars:
+            item = camera_health.get(role, {})
+            age = item.get("age_ms", capture_age)
+            frame = item.get("frame_number")
+            camera_meta = latest.camera_metadata.get(role, {}) if latest is not None else {}
+            if not isinstance(camera_meta, dict):
+                camera_meta = {}
+            if frame is None:
+                frame = camera_meta.get("frame_number")
+            age_text = f"{age:.0f} ms old" if self._finite_number(age) else "waiting for frame"
+            if self._finite_number(age) and age>1000:
+                age_text += " · stale"
+            if frame is not None:
+                age_text += f" · frame {frame}"
+            source_age = item.get("source_age_ms")
+            if self._finite_number(source_age):
+                age_text += f" · source {source_age:.0f} ms"
+            fps = item.get("fps")
+            if self._finite_number(fps):
+                age_text += f" · preview {fps:.1f} fps"
+            rows.append(f"{role.title()}: {age_text}")
+            if role in self.camera_title_vars:
+                self.camera_title_vars[role].set(f"{role.title()} · {actual.get(role) or 'unassigned'}")
+        self.camera_health.set("\n".join(rows))
+        storage = health.get("disk_free_bytes")
+        messages = [f"Free storage {storage/2**30:.1f} GiB" if self._finite_number(storage) else "Storage status unavailable"]
+        recording = health.get("recording", {})
+        if not recording.get("enabled", self.session.config.record_video):
+            messages.append("Video recording OFF")
+        elif recording.get("error") or recording.get("healthy") is False:
+            messages.append("Recording error: " + str(recording.get("error") or "writer unavailable"))
+        elif recording.get("writers"):
+            messages.append(f"{'Last recording' if recording.get('closed') else 'Recording'}: {recording.get('frames', 0)} video frames")
+        else:
+            messages.append("Video recording ON · writers open at rollout start")
+        if health.get("disk_error") or health.get("disk_warning"):
+            warning = health.get("disk_error") or health.get("disk_warning")
+            messages.append("Output storage is running low" if warning is True else str(warning))
+        self.health.set("\n".join(messages))
+        return health
 
     def _configure_theme(self):
         self.root.configure(bg=THEME["canvas"])
@@ -234,11 +519,13 @@ class DeploymentGUI:
     def _checkpoint_panel(self, parent):
         self.checkpoint_panel = panel = ttk.LabelFrame(parent, text="Choose a policy · nothing loads until requested", padding=SPACE["control"])
         panel.grid(row=0, column=0, sticky="ew", pady=(0, SPACE["group"]))
+        panel.columnconfigure(0, weight=1)
+        form = self._scrollable_content(panel, height=235)
         selected = self.session.config.metadata.get("reload_selection", {})
         for index, field in enumerate(self.reload_fields):
             row, column = divmod(index, 3)
-            panel.columnconfigure(column, weight=1, uniform="selection")
-            cell = ttk.Frame(panel)
+            form.columnconfigure(column, weight=1, uniform="selection")
+            cell = ttk.Frame(form)
             cell.grid(row=row, column=column, sticky="ew", padx=(0, SPACE["control"]) if column != 2 else 0, pady=(0, SPACE["control"]))
             cell.columnconfigure(0, weight=1)
             key, kind = field["key"], field.get("kind", "text")
@@ -250,15 +537,16 @@ class DeploymentGUI:
                 widget.bind("<<ComboboxSelected>>", lambda _event, key=key:self.resolve_selection(key))
             else:
                 widget = ttk.Entry(cell, textvariable=variable, width=1)
+                if field.get("readonly"):
+                    widget.configure(state="readonly")
             widget.grid(row=1, column=0, sticky="ew")
-            self.reload_widgets.append((widget, "readonly" if kind == "choice" else "normal"))
+            self.reload_widgets.append((widget, "readonly" if kind == "choice" or field.get("readonly") else "normal"))
             if kind in {"directory", "file"}:
                 button = ttk.Button(cell, text="Browse", command=lambda field=field:self.browse_checkpoint(field))
                 button.grid(row=1, column=1, padx=(SPACE["small"], 0))
-                self.reload_widgets.append((button, "normal"))
-        actions_row = (len(self.reload_fields) + 2) // 3
+                self.reload_widgets.append((button, "disabled" if field.get("readonly") else "normal"))
         files = ttk.Frame(panel)
-        files.grid(row=actions_row, column=0, columnspan=3, sticky="ew")
+        files.grid(row=1, column=0, sticky="ew", pady=(SPACE["control"], 0))
         files.columnconfigure(0, weight=1)
         config_buttons = ttk.Frame(files)
         config_buttons.grid(row=0, column=0, sticky="w")
@@ -271,7 +559,7 @@ class DeploymentGUI:
         self.load_button = ttk.Button(files, text="Load checkpoint", style="Accent.TButton", command=self.load_checkpoint, state="disabled")
         self.load_button.grid(row=0, column=1, sticky="e")
         self.load_error = tk.Text(panel, height=4, wrap="word", **self._text_style())
-        self.load_error.grid(row=actions_row + 1, column=0, columnspan=3, sticky="ew", pady=(SPACE["control"], 0))
+        self.load_error.grid(row=2, column=0, sticky="ew", pady=(SPACE["control"], 0))
         self.load_error.configure(state="disabled")
         self.load_error.grid_remove()
         self._record_selection(self.session, self.current_selection())
@@ -401,7 +689,8 @@ class DeploymentGUI:
             return False
         if not self.resolve_selection("load"):
             return False
-        self.save()
+        if not self.save():
+            return False
         selection = self.current_selection()
         self.session.record_event("reload_requested", selection=selection)
         previous, previous_config = self.session, copy.deepcopy(self.session.config)
@@ -472,6 +761,7 @@ class DeploymentGUI:
         self.folder_label.configure(text=str(session.folder))
         self.hz.set(str(session.config.target_hz))
         self.steps.set(str(session.config.max_steps))
+        self.record_video.set(session.config.record_video)
         self._apply_selection(session.config.metadata.get("reload_selection", {}))
         self._set_checkpoint_expanded(False)
         self.notes.configure(state="normal")
@@ -479,8 +769,17 @@ class DeploymentGUI:
         self._rows_seen, self._details_seen = None, None
         self._failure_notes_seen = None
         self._load_error_detail = None
+        self._last_save_error = None
         self._event_detail = ""
         self.failure_note.set("Select a saved rollout to view its result.")
+        self.result_summary.set("")
+        self.result_annotation.set("")
+        self._annotation_result_id = None
+        self._annotation_original = ""
+        self._camera_actual_seen = self._camera_mapping()
+        self._camera_draft_dirty = False
+        self.video_role.set(session.config.camera_roles[0])
+        self.video_role_selector.configure(values=session.config.camera_roles)
         self.photos = []
         for label in self.camera_labels:
             label.configure(image="", text="Waiting for frame")
@@ -528,9 +827,15 @@ class DeploymentGUI:
         panel.rowconfigure(1,weight=1)
         labels=[]
         for column,role in enumerate(roles):
-            ttk.Label(panel,text=role.title()).grid(row=0,column=column,sticky="w",pady=(0,4))
+            if title == "Live observations":
+                self.camera_title_vars[role] = variable = tk.StringVar(value=role.title())
+                ttk.Label(panel, textvariable=variable).grid(row=0,column=column,sticky="w",pady=(0,4))
+            else:
+                ttk.Label(panel,text=role.title()).grid(row=0,column=column,sticky="w",pady=(0,4))
             label=tk.Label(panel,bg=THEME["panel"],fg=THEME["muted"],text="Waiting for frame",width=1,height=1)
             label.grid(row=1,column=column,sticky="nsew",padx=(0,4) if column==0 else (4,0))
+            if title == "Live observations":
+                label.bind("<Double-Button-1>", lambda _event, role=role:self.zoom_live(role))
             labels.append(label)
         return labels
 
@@ -618,6 +923,51 @@ class DeploymentGUI:
             window.photos.append(photo)
             tk.Label(window,image=photo).grid(row=0,column=column)
 
+    def zoom_live(self, role):
+        with self.session.lock:
+            latest = self.session.latest
+            if latest is None or role not in latest.images:
+                return False
+            image = latest.images[role].copy()
+            metadata = copy.deepcopy(latest.camera_metadata.get(role, {}))
+        window = tk.Toplevel(self.root)
+        window.title(f"{role.title()} · observation snapshot")
+        preview = Image.fromarray(image)
+        preview.thumbnail((1100, 800))
+        window.photo = ImageTk.PhotoImage(preview, master=window)
+        ttk.Label(window, image=window.photo).pack()
+        ttk.Label(window, text="Snapshot only · live inference continues in the main window", padding=8).pack()
+        ttk.Label(window, text=json.dumps(metadata, ensure_ascii=False), wraplength=1000, padding=8).pack()
+        window.bind("<Escape>", lambda _event:(window.destroy(), "break")[-1])
+        return True
+
+    def show_help(self):
+        if self._help_window is not None and self._help_window.winfo_exists():
+            self._help_window.lift()
+            return
+        window = self._help_window = tk.Toplevel(self.root)
+        window.title("Deployment controls")
+        window.configure(bg=THEME["canvas"])
+        text = ("N  Start: home, then a fresh rollout\n"
+                "S / F  Mark Success / Failure, save, then return home\n"
+                "X / R  Stop and discard this attempt; remain stationary\n"
+                "H  Go to task home while ready\n"
+                "W  Save experiment notes\n"
+                "D  Confirm deletion of the last saved rollout\n"
+                "Esc  Stop and close deployment\n\n"
+                "Shortcuts are ignored while editing text or selecting a setting.\n"
+                "Hold a key once; repeated key events do not repeat commands.\n\n"
+                "Devices: refresh connected cameras, select each role, then Apply.\n"
+                "Swap changes the draft only; it never moves the robot.\n"
+                "Double-click a live image to inspect an observation snapshot.\n\n"
+                "Rollouts: select a saved result to open its folder or video and\n"
+                "add an annotation. Annotations never change the recorded outcome.\n\n"
+                "Success timing is chosen by the operator. Recorded duration is\n"
+                "the observed control interval, not an automatic task completion time.")
+        ttk.Label(window, text=text, padding=SPACE["section"], justify="left").pack()
+        ttk.Button(window, text="Close help", command=window.destroy).pack(pady=(0, SPACE["section"]))
+        window.bind("<Escape>", lambda _event:(window.destroy(), "break")[-1])
+
     def start(self):
         if self.closing or self._reload_in_progress:
             return False
@@ -643,7 +993,14 @@ class DeploymentGUI:
             if self.closing or self._reload_in_progress:
                 raise RuntimeError("Wait for checkpoint loading to finish")
             self.session.apply_settings(self.hz.get(),self.steps.get())
+            recording = getattr(self.session, "apply_recording", None)
+            if callable(recording):
+                recording(bool(self.record_video.get()))
             self._selection_context.update(target_hz=self.session.config.target_hz, max_steps=self.session.config.max_steps)
+            self._selection_context["record_video"] = self.session.config.record_video
+            if isinstance(self._selection_context.get("resolved_config"), dict):
+                self._selection_context["resolved_config"].update(target_hz=self.session.config.target_hz,
+                    max_steps=self.session.config.max_steps, record_video=self.session.config.record_video)
             self.status.set("Runtime settings applied")
         except Exception as error:
             self.status.set(str(error))
@@ -657,12 +1014,28 @@ class DeploymentGUI:
         if self.notes_job:
             self.root.after_cancel(self.notes_job)
         self.notes_job=None
-        self.session.save(self.notes.get("1.0","end-1c"))
-        self.status.set("Results and notes saved")
+        try:
+            self._remember_annotation()
+            if not self._flush_annotations():
+                return False
+            self.session.save(self.notes.get("1.0","end-1c"))
+            self._last_save_error = None
+            self.status.set("Results and notes saved")
+            return True
+        except Exception as error:
+            self._last_save_error = f"{type(error).__name__}: {error}"
+            self.status.set("Could not save notes. Text remains in the window; inspect storage in Settings.")
+            return False
 
     def delete(self):
         if not self.closing and not self._reload_in_progress and self.session.state=="READY" and self.session.results and messagebox.askyesno("Delete last result?","Delete the last saved result and its videos?",parent=self.root):
-            self.session.delete_previous()
+            identifier = self.session.results[-1]["id"]
+            if self.session.delete_previous():
+                self._annotation_drafts.pop(identifier, None)
+                if self._annotation_result_id == identifier:
+                    self._annotation_result_id = None
+                    self._annotation_original = ""
+                    self.result_annotation.set("")
 
     def _home_description(self):
         if callable(getattr(self.session.embodiment, "home_idle", None)):
@@ -679,6 +1052,9 @@ class DeploymentGUI:
 
     def keypress(self, event):
         key = event.keysym.lower()
+        if key == "f1":
+            self.show_help()
+            return "break"
         widget = event.widget
         widget_class = widget.winfo_class() if hasattr(widget, "winfo_class") else ""
         if isinstance(widget, (tk.Entry, tk.Text, tk.Spinbox, ttk.Entry, ttk.Combobox, ttk.Spinbox)) or widget_class in {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox", "Listbox"}:
@@ -731,7 +1107,15 @@ class DeploymentGUI:
                   "gripper_command_failed": "Gripper failed", "stop_unconfirmed": "Stop unconfirmed",
                   "stop_command_failed": "Stop failed", "policy_error": "Policy failed",
                   "state_feedback_error": "State feedback lost", "status_feedback_error": "Status unavailable",
-                  "recording_error": "Recording failed", "robot_fault": "Robot fault"}
+                  "recording_error": "Recording failed", "robot_fault": "Robot fault",
+                  "camera_error": "Camera failed", "camera_not_found": "Camera missing",
+                  "camera_not_connected": "Camera disconnected", "camera_frame_timeout": "Camera timed out",
+                  "camera_stale_frame": "Camera frame stalled", "camera_frame_invalid": "Invalid camera frame",
+                  "camera_capture_failed": "Camera capture failed", "camera_profile_mismatch": "Unexpected camera image",
+                  "camera_discovery_failed": "Camera discovery failed", "camera_profile_unsupported": "Camera mode unavailable",
+                  "camera_connect_timeout": "Camera connection timed out", "camera_connect_failed": "Camera connection failed",
+                  "camera_operation_pending": "Camera driver busy", "camera_stop_failed": "Camera stop failed",
+                  "camera_change_failed": "Camera change failed"}
         if category:
             return labels.get(category, "Unexpected failure")
         return "Operator" if result.get("outcome") == "failure" else ""
@@ -748,14 +1132,145 @@ class DeploymentGUI:
         return "Marked as failure by the operator." if result.get("outcome") == "failure" else "Marked as success by the operator."
 
     def show_result_note(self, _event=None):
-        selected = self.table.selection()
-        if not selected:
-            return
-        values = self.table.item(selected[0], "values")
-        with self.session.lock:
-            result = next((row for row in self.session.results if str(row["id"]) == str(values[0])), None)
+        result = self._selected_result()
         if result is not None:
             self.failure_note.set(self._result_note(result))
+            source = str(result.get("outcome_source", "manual")).replace("_", " ")
+            duration = result.get("active_duration_s")
+            text = f"{source.title()} outcome · {result.get('steps', 0)} executed actions"
+            if self._finite_number(duration):
+                text += f" · {duration:.2f} s observed"
+            home = result.get("outcome_home")
+            if home:
+                text += f"\nReturn home: {home}"
+            self.result_summary.set(text)
+            if self._annotation_result_id != result["id"]:
+                self._remember_annotation()
+                self._flush_annotations()
+                self.result_annotation.set(self._annotation_drafts.get(result["id"], str(result.get("operator_note", ""))))
+                self._annotation_result_id = result["id"]
+                self._annotation_original = str(result.get("operator_note", ""))
+
+    def _selected_result(self):
+        selected = self.table.selection()
+        if not selected:
+            return None
+        values = self.table.item(selected[0], "values")
+        if not values:
+            return None
+        with self.session.lock:
+            result = next((copy.deepcopy(row) for row in self.session.results if str(row["id"]) == str(values[0])), None)
+        return result
+
+    def _selected_result_folder(self):
+        result = self._selected_result()
+        if result is None:
+            return None
+        folder = self.session.folder.resolve()
+        relative = Path(str(result.get("directory", "")))
+        if relative.is_absolute() or len(relative.parts) != 1:
+            raise ValueError("Saved rollout directory is outside this session")
+        selected = (folder / relative).resolve()
+        if selected.parent != folder or not selected.is_dir():
+            raise ValueError("Saved rollout directory is unavailable or outside this session")
+        return selected
+
+    def _launch_path(self, path):
+        path = Path(path).resolve(strict=True)
+        if sys.platform == "darwin":
+            program = shutil.which("open")
+        elif sys.platform == "win32":
+            program = None
+        else:
+            program = shutil.which("xdg-open")
+        if not program:
+            self.status.set("No desktop opener is available. Use Copy path to open this record manually.")
+            return False
+        events = self._utility_events
+        def launch():
+            try:
+                result = subprocess.run([program, str(path)], stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+                if result.returncode:
+                    events.put("The desktop could not open this record. Use Copy path instead.")
+            except (OSError, subprocess.TimeoutExpired):
+                events.put("The desktop opener did not respond. Use Copy path instead.")
+        threading.Thread(target=launch, name="record-opener", daemon=True).start()
+        self.status.set("Opening selected record in the desktop application")
+        return True
+
+    def open_result_folder(self):
+        try:
+            folder = self._selected_result_folder() or self.session.folder.resolve(strict=True)
+            return self._launch_path(folder)
+        except Exception as error:
+            self.status.set(f"Cannot open result: {error}")
+            return False
+
+    def open_result_video(self):
+        try:
+            folder = self._selected_result_folder()
+            role = self.video_role.get()
+            if folder is None or role not in self.session.config.camera_roles:
+                raise ValueError("Select a saved rollout and camera role first")
+            path = (folder / f"{role}.mp4").resolve(strict=True)
+            if path.parent != folder:
+                raise ValueError("Video path is outside the saved rollout")
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ValueError("The selected camera has no saved video")
+            return self._launch_path(path)
+        except Exception as error:
+            self.status.set(f"Cannot open video: {error}")
+            return False
+
+    def copy_result_path(self):
+        try:
+            folder = self._selected_result_folder() or self.session.folder.resolve(strict=True)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(str(folder))
+            self.status.set("Selected result path copied")
+            return True
+        except Exception as error:
+            self.status.set(f"Cannot copy result path: {error}")
+            return False
+
+    def save_result_annotation(self):
+        if self.closing or self._reload_in_progress:
+            return False
+        self._remember_annotation()
+        return self._flush_annotations()
+
+    def _remember_annotation(self):
+        if self._annotation_result_id is not None and self.result_annotation.get() != self._annotation_original:
+            self._annotation_drafts[self._annotation_result_id] = self.result_annotation.get()
+
+    def schedule_annotation(self, _event=None):
+        self._remember_annotation()
+        if self._annotation_job:
+            self.root.after_cancel(self._annotation_job)
+        self._annotation_job = self.root.after(500, self._flush_annotations)
+
+    def _flush_annotations(self):
+        if self._annotation_job:
+            self.root.after_cancel(self._annotation_job)
+            self._annotation_job = None
+        if not self._annotation_drafts:
+            return True
+        operation = getattr(self.session, "annotate_result", None)
+        if not callable(operation):
+            return False
+        try:
+            for identifier, note in list(self._annotation_drafts.items()):
+                if not operation(identifier, note):
+                    raise RuntimeError("Saved rollout is unavailable for annotation")
+                self._annotation_drafts.pop(identifier, None)
+                if identifier == self._annotation_result_id:
+                    self._annotation_original = note
+            self.status.set("Rollout annotation saved; its outcome is unchanged")
+            return True
+        except Exception as error:
+            self.status.set(f"Could not save annotation: {error}")
+        return False
 
     def _show_images(self,images,labels):
         for image,label in zip(images,labels):
@@ -766,6 +1281,11 @@ class DeploymentGUI:
             label.configure(image=photo,text="")
 
     def refresh(self):
+        try:
+            while True:
+                self.status.set(self._utility_events.get_nowait())
+        except queue.Empty:
+            pass
         try:
             while True:
                 event=self.session.events.get_nowait()
@@ -781,6 +1301,19 @@ class DeploymentGUI:
             rows=list(self.session.rows)
             results=list(self.session.results)
             latest=self.session.latest
+        health = self._update_device_status(latest)
+        policy_metadata = getattr(self.session.policy, "metadata", {})
+        if state == "SELECTING":
+            self.active_identity.set("No policy loaded · camera preview only")
+        else:
+            identity = [f"Active: {self.session.config.method}"]
+            gate = policy_metadata.get("gate") or self.session.config.metadata.get("gate")
+            gate_status = policy_metadata.get("gate_status") or self.session.config.metadata.get("gate_status")
+            if gate:
+                identity.append(f"Gate {gate}")
+            if gate_status:
+                identity.append(str(gate_status))
+            self.active_identity.set(" · ".join(identity))
         if state == "ERROR" and self.session._startup_error and self._load_error_session is not self.session:
             self._load_error_session = self.session
             self._show_load_error(self.session.error, getattr(self.session, "error_detail", None))
@@ -790,10 +1323,11 @@ class DeploymentGUI:
                         "CONNECTING": "Connecting", "RECOVERY_REQUIRED": "Recovery needed",
                         "RECOVERING": "Checking robot", "WAITING_OUTCOME": "Choose outcome",
                         "HOMING": "Going home", "STARTING": "Starting", "RUNNING": "Running",
-                        "STOPPING": "Stopping", "ERROR": "Stopped with error", "CLOSED": "Closed"}
+                        "STOPPING": "Stopping", "ERROR": "Stopped with error", "CLOSED": "Closed",
+                        "CAMERA_ERROR": "Camera unavailable", "RECONFIGURING": "Changing cameras"}
         self.state.set(state_labels.get(displayed_state, displayed_state.replace("_", " ").capitalize()))
         self.state_label.configure(style=("Ready.State.TLabel" if displayed_state == "READY" else
-                                         "Fault.State.TLabel" if displayed_state in {"ERROR", "RECOVERY_REQUIRED"} else
+                                         "Fault.State.TLabel" if displayed_state in {"ERROR", "RECOVERY_REQUIRED", "CAMERA_ERROR"} else
                                          "Pending.State.TLabel" if displayed_state not in {"SELECTING", "CLOSED"} else "State.TLabel"))
         if state == "ERROR" and not self._reload_in_progress:
             self.status.set("Deployment stopped. Recorded logs and results are preserved. Open Details to inspect the cause before loading again.")
@@ -807,10 +1341,14 @@ class DeploymentGUI:
             self.status.set("Opening camera preview. Policy and robot control remain disconnected.")
         elif state == "SELECTING":
             self.status.set("Choose a task and checkpoint, then Load checkpoint. No policy is loaded.")
+        elif state == "CAMERA_ERROR":
+            self.status.set("Camera unavailable. Open Devices to change assignments or restart preview; the loaded policy is preserved.")
+        elif state == "RECONFIGURING":
+            self.status.set("Changing camera streams. No motion is requested; Start remains a separate action.")
         ready=state=="READY" and not self.closing and not self._reload_in_progress
         recovery=state in {"RECOVERY_REQUIRED", "RECOVERING"} or self.session._recovery_fault
         active=state in {"STARTING","HOMING","RUNNING","WAITING_OUTCOME","STOPPING", "RECOVERY_REQUIRED", "RECOVERING"}
-        self.start_button.configure(state="normal" if ready else "disabled")
+        self.start_button.configure(state="normal" if ready and health.get("can_start", True) else "disabled")
         for button in (self.stop_button,self.retry_button):
             button.configure(state="normal" if active else "disabled")
         self.recover_button.configure(text="Checking robot..." if state == "RECOVERING" else "Recover robot",
@@ -825,11 +1363,13 @@ class DeploymentGUI:
             self.control_hint.configure(text=f"{reason}. Resolve the robot condition.\nThen Recover robot before Home / Start.", foreground=THEME["danger"])
         elif state == "HOMING":
             self.control_hint.configure(text="Moving to task home. Stop cancels the move.\n" + self._home_description(), foreground=THEME["muted"])
+        elif ready and not health.get("can_start", True):
+            self.control_hint.configure(text="Start unavailable: " + str(health.get("reason") or "Check device and storage status") + "\nOpen Devices / Settings to resolve it.", foreground=THEME["warning"])
         else:
             self.control_hint.configure(text="Start: home, then a fresh rollout.\n" + self._home_description(), foreground=THEME["muted"])
         for button in (self.success_button,self.failure_button):
             button.configure(state="normal" if state in {"RUNNING","WAITING_OUTCOME"} else "disabled")
-        for widget in (self.apply_button,self.hz_entry,self.steps_entry):
+        for widget in (self.apply_button,self.hz_entry,self.steps_entry,self.record_video_toggle):
             widget.configure(state="normal" if ready else "disabled")
         self.delete_button.configure(state="normal" if ready and results else "disabled")
         if self.reload_fields:
@@ -839,13 +1379,26 @@ class DeploymentGUI:
                 widget.configure(state=enabled_state if allowed else "disabled")
             self.load_button.configure(state="normal" if allowed else "disabled")
         self.notes.configure(state="disabled" if self.closing or self._reload_in_progress else "normal")
+        annotation_allowed = not self.closing and not self._reload_in_progress and bool(self.table.selection()) and callable(getattr(self.session, "annotate_result", None))
+        self.annotation_entry.configure(state="normal" if annotation_allowed else "disabled")
+        self.annotation_button.configure(state="normal" if annotation_allowed else "disabled")
+        self.open_video_button.configure(state="normal" if self.table.selection() else "disabled")
         stats=summary(rows)
         latency=stats["latency"]["policy_ms"]
         hz=stats["achieved_command_hz"]
         self.metrics.set(f"Target {self.session.config.target_hz:g} Hz   ·   Actual {hz:.2f} Hz" if hz is not None else f"Target {self.session.config.target_hz:g} Hz   ·   Actual —")
-        self.metrics.set(self.metrics.get() + f"\nSteps {stats['steps']}   ·   Active {stats['active_duration_s']:.1f} s")
+        self.metrics.set(self.metrics.get() + f"\nActions {stats['steps']}   ·   Interval {stats['active_duration_s']:.1f} s")
         if latency:
             self.metrics.set(self.metrics.get() + f"\nPolicy / step {latency['mean_ms']:.1f} ms (mean)")
+        gpu = stats["latency"].get("model_gpu_ms")
+        if gpu and self._finite_number(gpu.get("amortized_ms_per_executed_action")):
+            self.metrics.set(self.metrics.get() + f"\nGPU / action {gpu['amortized_ms_per_executed_action']:.1f} ms")
+        misses = stats.get("deadline_misses")
+        if isinstance(misses, int):
+            self.metrics.set(self.metrics.get() + f"   ·   Late {misses}")
+        calls, requests = stats.get("backbone_calls"), stats.get("rpc_requests")
+        if isinstance(calls, int) and isinstance(requests, int):
+            self.metrics.set(self.metrics.get() + f"\nBackbone calls {calls}   ·   RPC requests {requests}")
         successes = sum(r["outcome"] == "success" for r in results)
         failures = sum(r["outcome"] == "failure" for r in results)
         rate = f"{100*successes/len(results):.1f}%" if results else "—"
@@ -869,6 +1422,10 @@ class DeploymentGUI:
                 self.show_result_note()
             else:
                 self.failure_note.set("Select a saved rollout to view its result.")
+                self.result_summary.set("")
+                self.result_annotation.set("")
+                self._annotation_result_id = None
+                self._annotation_original = ""
             self._rows_seen = rendered
         failure_notes = "\n\n".join((f"Rollout {note['rollout_id']}: " if note.get("rollout_id") is not None else "Outside rollout: ") + self._result_note(note) for note in automatic_notes) or "No automatic failures recorded."
         if failure_notes != self._failure_notes_seen:
@@ -881,6 +1438,8 @@ class DeploymentGUI:
                               "selection": self.session.config.metadata.get("reload_selection", {}),
                               "results": str(self.session.folder), "latest_status_detail": self._event_detail,
                               "error": self.session.error, "load_error": self._load_error_detail,
+                              "save_error": self._last_save_error, "device_status": getattr(self.session, "device_status", {}),
+                              "operator_health": health, "selected_rollout": self._selected_result(),
                               "failure_results": [r for r in results if r.get("failure_reason")],
                               "automatic_notes": automatic_notes,
                               "reference_error": self._reference_error,
@@ -893,7 +1452,9 @@ class DeploymentGUI:
             self._details_seen = details
         self.photos=[]
         if latest:
-            self._show_images([latest.images[r] for r in self.session.config.camera_roles],self.camera_labels)
+            images = [latest.images.get(r) for r in self.session.config.camera_roles]
+            if all(image is not None for image in images):
+                self._show_images(images,self.camera_labels)
         if self.reference_images:
             self._show_images(self.reference_images,self.reference_labels)
         if (self.closing and self.session.shutdown_complete and not self._reload_in_progress

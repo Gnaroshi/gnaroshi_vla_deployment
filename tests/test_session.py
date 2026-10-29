@@ -120,7 +120,7 @@ class Sessions(unittest.TestCase):
         self.assertEqual(len(files),1)
         self.assertEqual(json.loads(files[0].read_text())["outcome"],"failure")
 
-    def test_policy_health_failure_prevents_home_and_rearming(self):
+    def test_policy_health_failure_prevents_motion_but_allows_explicit_reload_after_cleanup(self):
         class HealthPolicy(MockPolicy):
             failed = False
             def check_ready(self):
@@ -134,7 +134,9 @@ class Sessions(unittest.TestCase):
         session.worker.join(1)
         self.assertEqual(session.embodiment.home_count, 0)
         self.assertEqual(session.embodiment.applied, [])
-        self.assertFalse(session.can_replace)
+        self.assertTrue(session.replacement_closed)
+        self.assertTrue(session.can_replace)
+        self.assertFalse(session.start_rollout())
 
     def test_policy_health_is_checked_while_ready(self):
         class HealthPolicy(MockPolicy):

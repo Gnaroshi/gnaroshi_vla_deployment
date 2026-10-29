@@ -2,16 +2,30 @@
 from __future__ import annotations
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import time
+import uuid
 import numpy as np
 
 
+def write_text(path: Path, text):
+    """Publish a complete record, including when notes and the worker save together."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_json(path: Path, payload):
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)+"\n")
-    temporary.replace(path)
+    write_text(path, json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False)+"\n")
 
 
 def provenance(repo: Path):
@@ -26,8 +40,14 @@ class RolloutRecorder:
     def __init__(self, folder: Path, fps: float, video: bool):
         self.folder = folder
         folder.mkdir()
-        self.log = (folder / "steps.jsonl").open("x")
-        self.timestamps = (folder / "frames.jsonl").open("x")
+        self.log = self.timestamps = None
+        try:
+            self.log = (folder / "steps.jsonl").open("x")
+            self.timestamps = (folder / "frames.jsonl").open("x")
+        except Exception:
+            if self.log is not None:
+                self.log.close()
+            raise
         self.writers = {}
         self.video = video
         self.target_hz = fps
@@ -40,6 +60,15 @@ class RolloutRecorder:
         self.count = 0
         self.pending_images = None
         self.pending_source = None
+        self.image_shapes = {}
+        self.closed = False
+        self.error = None
+
+    @property
+    def health(self):
+        return {"enabled": self.video, "healthy": self.error is None,
+                "frames": self.video_frames, "observations": self.count,
+                "writers": list(self.writers), "closed": self.closed, "error": self.error}
 
     def _emit_pending(self,count):
         if count<=0 or self.pending_images is None:
@@ -50,7 +79,8 @@ class RolloutRecorder:
             for role,frame in self.pending_images.items():
                 bgr=cv2.cvtColor(frame,cv2.COLOR_RGB2BGR)
                 for _ in range(count):
-                    self.writers[role].write(bgr)
+                    if self.writers[role].write(bgr) is False:
+                        raise RuntimeError(f"The {role} video writer rejected a frame")
             self.timestamps.write(json.dumps({"kind":"video_frames",**self.pending_source,
                                               "video_frame_start":start,"video_frame_end_exclusive":start+count,
                                               "video_fps":self.fps})+"\n")
@@ -58,11 +88,20 @@ class RolloutRecorder:
 
     def prepare(self, images):
         """Check codec/role/shape before issuing the first policy command."""
+        if self.closed:
+            raise RuntimeError("The rollout recorder is closed")
+        if self.image_shapes and set(images) != set(self.image_shapes):
+            raise ValueError("Camera roles changed during the recorded rollout")
         for role,frame in images.items():
             if not role or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role):
                 raise ValueError("Camera role must be a simple filename identifier")
             if frame.dtype!=np.uint8 or frame.ndim!=3 or frame.shape[2]!=3:
                 raise ValueError("Recorded images must be RGB uint8 HWC")
+            if role in self.image_shapes and tuple(frame.shape) != self.image_shapes[role]:
+                raise ValueError(f"{role} image size changed during the recorded rollout")
+            self.image_shapes[role] = tuple(frame.shape)
+            if role in self.writers and not self.writers[role].isOpened():
+                raise RuntimeError(f"The {role} video writer stopped recording")
             if self.video and role not in self.writers:
                 import cv2
                 height, width = frame.shape[:2]
@@ -107,12 +146,15 @@ class RolloutRecorder:
         self.count += 1
 
     def close(self):
+        if self.closed:
+            return
         error = None
         try:
             self._emit_pending(1)
         except Exception as failure:
             error = failure
         finally:
+            self.closed = True
             self.pending_images = None
             for resource in (self.log, self.timestamps, *self.writers.values()):
                 try:
@@ -120,6 +162,7 @@ class RolloutRecorder:
                 except Exception as failure:
                     error = error or failure
         if error is not None:
+            self.error = f"{type(error).__name__}: {error}"
             raise error
 
 
@@ -128,11 +171,16 @@ def summary(rows):
     actual = (len(times)-1)/(times[-1]-times[0]) if len(times)>1 and times[-1]>times[0] else None
     def stats(key):
         values = [r[key] for r in rows if r.get(key) is not None]
-        return {"count": len(values), "mean_ms": float(np.mean(values)),
+        return {"count": len(values), "sum_ms": float(np.sum(values)),
+                "amortized_ms_per_executed_action": float(np.sum(values)/len(rows)) if rows else None,
+                "mean_ms": float(np.mean(values)),
                 "p50_ms": float(np.percentile(values,50)), "p95_ms": float(np.percentile(values,95))} if values else None
+    backbone_calls = sum(r.get("backbone_call_delta") or 0 for r in rows) if any(r.get("backbone_calls") is not None or (r.get("backbone_call_delta") or 0)>0 for r in rows) else None
     return {"steps": len(rows), "achieved_command_hz": actual,
             "active_duration_s": times[-1]-times[0] if len(times)>1 else 0.0,
-            "latency": {key: stats(key) for key in ("capture_ms", "policy_ms", "rpc_ms", "server_infer_ms", "model_gpu_ms", "command_ms", "work_ms", "media_write_ms", "loop_work_ms")},
+            "latency": {key: stats(key) for key in ("capture_ms", "policy_ms", "rpc_ms", "rpc_overhead_ms", "server_infer_ms", "model_gpu_ms", "command_ms", "work_ms", "media_write_ms", "loop_work_ms")},
             "deadline_misses": sum(r["deadline_miss"] for r in rows),
-            "full_calls": sum(r.get("backbone_call_delta") or 0 for r in rows) if any(r.get("backbone_calls") is not None or (r.get("backbone_call_delta") or 0)>0 for r in rows) else None,
+            "full_calls": backbone_calls, "backbone_calls": backbone_calls,
+            "rpc_requests": sum(r.get("rpc_ms") is not None and not r.get("buffered", False) for r in rows),
+            "client_buffered_steps": sum(bool(r.get("buffered")) for r in rows),
             "buffered_steps": sum(bool(r.get("buffered")) for r in rows)}
