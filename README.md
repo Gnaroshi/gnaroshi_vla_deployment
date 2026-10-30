@@ -85,7 +85,8 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 | Recover robot | 보호정지 해제 후 상태·정지 확인 → 정책 버퍼 초기화 → READY |
 | Save `[W]` | 결과와 notes 저장; notes 편집도 자동 저장 |
 | Devices | 카메라 검색·역할 변경·swap·카메라만 재연결 |
-| Record video | READY에서 다음 rollout의 영상 저장 ON/OFF |
+| Config | READY에서 실행 속도·명령 수·녹화 변경, 다음 Load에 적용할 정책 설정 편집 |
+| Settings | 글자 크기·참고 장면 표시·pane 배치 등 GUI 설정 |
 | Help `[F1]` | 단축키·운용 안내 |
 | Delete last `[D]` | 확인 후 마지막 저장 결과/영상 삭제 |
 | Exit `[Esc]` | pending action 취소 → 미분류 attempt 폐기 → 장치 종료 |
@@ -113,7 +114,8 @@ Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5
 
 로봇을 반복 평가하는 operator가 현재 상태와 다음 조작, 저장된 결과를 바로 읽도록 구성한다.
 상단의 **Success / Failure / Success rate / Total**은 현재 session에서 저장·확정한 rollout만
-집계한다. 자동 fault의 Failure도 포함하며 Stop/Retry로 폐기한 attempt와 idle 오류는 제외한다.
+집계한다. 자동 fault도 Failure 합계에 포함하고, Failure 바로 아래에 그중 자동 실패 수를 표시한다.
+Stop/Retry로 폐기한 attempt와 idle 오류는 제외한다.
 Success 이후 복귀 Home 오류는 이미 확정된 outcome을 바꾸지 않는다. 0개일 때 성공률은
 분모가 없으므로 `—`다. 다른 checkpoint를 Load하면 새 session의 집계를 보여주며 이전 결과는 보존한다.
 
@@ -132,10 +134,18 @@ Ctrl+0으로 기본값을 복원한다. 제목·본문·보조문구·수치는 
 local presentation persistence는 workspace.py에서 관리한다.
 큰 글자로 낮은 창을 사용할 때는 긴 instruction과 policy 설명을 **Context**에서 펼쳐 볼 수 있다.
 Policy 설정은 오른쪽 inspector에서 편집하므로 폼이나 로드 오류가 카메라를 아래로 밀지 않는다.
-측정값은 내용에 필요한 높이만 사용한다. Settings의 **Show training reference**로 참고 장면을
-펼칠 수 있고, 표시 여부도 저장한다. 상단 **Inspector**는 오른쪽 작업 영역을 숨기거나 펼친다.
+측정값은 내용에 필요한 높이만 사용한다. 학습 예시 manifest가 있으면 참고 장면을 기본으로
+표시한다. Settings의 **Training examples**에서 명시적으로 바꾼 표시 여부는 다음 실행에도 유지한다.
+상단 **Inspector**는 오른쪽 작업 영역을 숨기거나 펼친다.
 **Save notes [W]**는 Notes에, 확인 후 삭제하는 **Delete last [D]**는 Rollouts에 둔다.
 설정 입력칸으로 Tab 이동하면 중첩된 스크롤 영역도 해당 입력칸을 보이도록 따라간다.
+휠은 포인터가 있는 입력 폼·텍스트·결과 목록을 스크롤한다. 닫힌 task/camera picker 위의 휠은
+선택값을 바꾸지 않는다. Details 갱신은 읽던 위치·커서·선택을 유지하며, 선택한 텍스트는
+선택을 해제할 때까지 보존한다.
+
+하단 상태 바는 준비·로딩·실행·정지·복구 단계와 다음 행동을 보여준다. 실행 중 진행 막대는
+명령 수와 설정된 한도를 나타낸다. 한도 도달 뒤에는 수동 outcome을 기다리며 성공으로 판정하지 않는다.
+로딩·Home·정지·복구처럼 전체 작업량이 정해지지 않은 단계에는 실제 단계명과 대기 표시를 사용한다.
 
 글자·창·pane 배치는 local UI preferences에 보관한다. 글자 크기는 선택 즉시 저장하므로
 checkpoint 교체나 다음 실행에서도 마지막 값을 복원한다. 저장하지 못하면 Settings에 오류를
@@ -166,6 +176,9 @@ DeploymentGUI(root, session,
 
 `kind`는 `directory`, `file`, `text`, `choice`를 지원한다. 초기 선택은
 `config.metadata['reload_selection']`이 우선하며 각 field의 `value`가 기본값이다.
+기본 `section='policy'`는 Policy에 표시하고, optional `section='config'`는 Config에 표시한다.
+Config의 프로젝트별 field는 다음 **Load checkpoint**에 적용할 draft다. READY에서 바로 바꿀 수 있는
+target Hz·max commands·녹화 설정은 같은 탭의 별도 Apply 영역에 둔다. Settings는 GUI 설정만 다룬다.
 헤더의 **Policy**로 inspector의 Policy 탭을 연다. Load 요청을 수락하면 Rollouts 탭으로
 돌아간다. Load 버튼은 긴 설정 폼의 스크롤 밖에 둔다. 로드 오류는 Policy 탭에 요약을,
 Details에 전체 진단 정보를 보여주며
@@ -225,7 +238,7 @@ Adapter는 optional `list_camera_devices()`와 `configure_cameras(serials, cance
 sensor timestamp, 잘못된 RGB shape/type을 camera fault로 기록한다. Hardware clock을 host epoch와
 직접 비교하지 않는다. 역할 identity와 실제 교체 내역은 manifest·event·rollout에 기록한다.
 
-Settings에서 영상 녹화 ON/OFF와 runtime 설정을 바꿀 수 있다. 출력 저장 공간과 녹화 상태,
+Config에서 영상 녹화 ON/OFF와 runtime 설정을 바꿀 수 있다. 출력 저장 공간과 녹화 상태,
 preview 수신률·프레임 나이도 표시한다. 기본 free storage256MiB 미만이면 Home/첫 command 전에
 Start를 막고, 실행 중 부족해지면 기록을 보존하며 정지한다. Warning 기본값은2GiB다.
 `SessionConfig.metadata`의 `min_free_disk_bytes` / `warn_free_disk_bytes`로 프로젝트가 조정한다.
@@ -235,6 +248,13 @@ Rollouts에서 결과를 선택해 폴더·카메라별 영상 열기, 경로 �
 메모는 자동 저장하며 outcome·원본 step log·영상을 바꾸지 않는다. 사용자 notes도 편집 시 자동
 저장한다. 창의 checkpoint form과 설정 tab은 작은 화면에서 스크롤할 수 있다. Live image를
 더블클릭하면 해당 관측 snapshot을 확대하고 F1으로 단축키를 확인한다.
+Config의 **Saved profiles → Save config / Load config**는 프로젝트가 제공하는 JSON 저장·복원 기능이다.
+JSON을 불러오는 동작은 draft만 바꾸며 정책을 자동으로 로드하지 않는다.
+
+Ubuntu에서 기존 MP4의 디코더가 없으면 Open video가 선택 영상 하나의 VP8/WebM 호환본을
+ignored `.runtime/playback`에 준비하고 desktop player로 연다. 원본 녹화·FPS·프레임 순서·제어 루프는
+유지한다. 준비는 GUI 밖에서 수행하고 결과 목록 옆에 진행·오류를 표시한다. 재요청은 캐시를 사용하며,
+종료 시 진행 중인 변환을 취소하고 소유 프로세스를 회수한다. 기존 녹화를 일괄 변환하지 않는다.
 
 GPU/RPC 지연은 관측된 호출당 평균과 전체 실행 action당 적산 평균을 구분해 저장한다.
 `amortized_ms_per_executed_action`을 이용하면 client-buffered step을 포함한 분모로 비교할 수 있다.

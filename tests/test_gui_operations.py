@@ -4,6 +4,7 @@ import gc
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import tkinter as tk
@@ -11,6 +12,7 @@ from tkinter import ttk
 from tkinter import font as tkfont
 import unittest
 from unittest.mock import patch
+from PIL import Image, ImageTk
 
 from gnaroshi_deployment.adapters.mock import MockEmbodiment, MockPolicy
 from gnaroshi_deployment.contracts import RobotRecoveryRequired, SessionConfig
@@ -59,10 +61,10 @@ class GUIOperations(unittest.TestCase):
             self.root.update()
             time.sleep(.005)
 
-    def launch(self, *, embodiment=None, policy=None, selecting=False, config_metadata=None, **gui_options):
+    def launch(self, *, embodiment=None, policy=None, selecting=False, config_metadata=None, reference_manifest=None, **gui_options):
         metadata = {"defer_policy_load": selecting,**(config_metadata or {})}
         config = SessionConfig(task="CPU demo", method="Mock · no hardware", output_root=self.temporary.name,
-                               record_video=False, target_hz=200, metadata=metadata)
+                               record_video=False, target_hz=200, metadata=metadata, reference_manifest=reference_manifest)
         session = DeploymentSession(config, policy or MockPolicy(.001), embodiment or MockEmbodiment(), Path(__file__).parents[1])
         self.app = DeploymentGUI(self.root, session, **gui_options)
         self.wait(lambda: session.state == ("SELECTING" if selecting else "READY"))
@@ -527,6 +529,181 @@ class GUIOperations(unittest.TestCase):
         self.assertGreaterEqual(last.winfo_rooty(),viewport.winfo_rooty())
         self.assertLessEqual(last.winfo_rooty()+last.winfo_height(),viewport.winfo_rooty()+viewport.winfo_height())
         self.assertEqual(len(session.results),12)
+
+    def test_selecting_config_drafts_are_saved_and_loaded_without_starting_a_rollout(self):
+        calls=[]
+        def factory(selection,previous):
+            calls.append(dict(selection))
+            config=SessionConfig(task=previous.task,method="Loaded mock",instruction=previous.instruction,
+                output_root=self.temporary.name,record_video=selection["record_video"],target_hz=selection["target_hz"],
+                max_steps=selection["max_steps"],metadata={"reload_selection":dict(selection)})
+            return DeploymentSession(config,MockPolicy(),MockEmbodiment(),Path(__file__).parents[1])
+        fields=[{"key":"checkpoint","label":"Checkpoint","value":"first"},
+                {"key":"gain","label":"Gain","value":"initial","section":"config"}]
+        self.launch(selecting=True,reload_fields=fields,reload_factory=factory,
+            config_metadata={"reload_selection":{"target_hz":15,"max_steps":5000,"record_video":True}},
+            config_saver=lambda path,values:path.write_text(json.dumps(values)),
+            config_loader=lambda path:json.loads(path.read_text()))
+        self.app.refresh()
+        self.assertTrue(self.app.record_video.get(),"Preview recording OFF must not replace the selected recipe")
+        self.assertEqual(str(self.app.hz_entry.cget("state")),"normal")
+        self.assertEqual(str(self.app.apply_button.cget("state")),"disabled")
+        self.app.hz.set("17.5");self.app.steps.set("3456");self.app.record_video.set(False)
+        self.app.reload_vars["gain"].set("chosen")
+        self.app.notes.insert("1.0","Keep the configuration experiment note")
+        profile=Path(self.temporary.name)/"profile.json"
+        self.assertTrue(self.app.save_config(profile))
+        saved=json.loads(profile.read_text())
+        self.assertEqual((saved["target_hz"],saved["max_steps"],saved["record_video"],saved["gain"]),(17.5,3456,False,"chosen"))
+        self.app.hz.set("invalid")
+        self.assertEqual(self.app.current_selection()["target_hz"],"invalid")
+        self.assertFalse(self.app.save_config(profile))
+        self.assertFalse(self.app.load_checkpoint())
+        self.assertEqual(self.app.hz.get(),"invalid")
+        self.assertEqual(calls,[])
+        self.assertTrue(self.app.load_config(profile))
+        self.assertIn("Keep the configuration",self.app.notes.get("1.0","end"))
+        self.assertTrue(self.app.load_checkpoint())
+        self.wait(lambda:len(calls)==1 and self.app.session.state=="READY" and not self.app._reload_in_progress)
+        self.assertEqual((self.app.session.config.target_hz,self.app.session.config.max_steps,self.app.session.config.record_video),(17.5,3456,False))
+        self.assertEqual(self.app.session.embodiment.home_count,0)
+        self.assertEqual(self.app.session.embodiment.applied,[])
+        self.assertTrue(str(self.app.hz_entry).startswith(str(self.app.config_tab)))
+        self.assertFalse(str(self.app.hz_entry).startswith(str(self.app.settings_tab)))
+
+    def wheel(self,widget,sequence,**options):
+        widget.event_generate("<Motion>",warp=True,x=12,y=12)
+        self.root.update()
+        widget.event_generate(sequence,x=12,y=12,**options)
+        self.root.update()
+
+    def test_wheel_scrolls_the_pointed_form_without_changing_a_closed_picker(self):
+        fields=[{"key":"task","label":"Task","kind":"choice","choices":["first","second"],"value":"first"}]
+        fields.extend({"key":f"field_{number}","label":f"Field {number}","value":"draft"} for number in range(20))
+        self.launch(selecting=True,reload_fields=fields,reload_factory=lambda *_args:None)
+        self.root.deiconify();self.root.geometry("1280x900+0+0");self.settle_layout()
+        picker=self.app.reload_widgets[0][0]
+        viewport=self.app._selection_form.scroll_canvas
+        self.wheel(picker,"<Button-5>")
+        self.assertEqual(self.app.reload_vars["task"].get(),"first")
+        self.assertGreater(viewport.yview()[0],0)
+        after_down=viewport.yview()[0]
+        for _ in range(8):
+            self.wheel(viewport,"<MouseWheel>",delta=15)
+        self.assertLess(viewport.yview()[0],after_down)
+        self.app.tabs.select(next(tab for tab in self.app.tabs.tabs() if self.app.tabs.tab(tab,"text")=="Notes"))
+        self.settle_layout()
+        self.app.notes.insert("1.0","\n".join(f"Note {number}" for number in range(300)))
+        self.app.notes.yview_moveto(0)
+        outer=self.app.workspace_canvas.yview()
+        self.wheel(self.app.notes,"<Button-5>")
+        self.assertGreater(self.app.notes.yview()[0],0)
+        self.assertEqual(self.app.workspace_canvas.yview(),outer)
+
+    def test_running_refresh_keeps_buttons_images_and_the_details_reading_position(self):
+        session=self.launch()
+        self.root.deiconify();self.root.geometry("1366x768+0+0")
+        self.app.tabs.select(self.app.details_tab)
+        self.app.start()
+        self.wait(lambda:session.state=="RUNNING" and self.app.state.get()=="Running")
+        self.settle_layout()
+        details=self.app.details
+        details.yview_moveto(.5)
+        top=details.index("@0,0")
+        line=int(top.split(".")[0])+2
+        details.mark_set("insert",f"{line}.4")
+        details.tag_add("sel",f"{line}.0",f"{line}.8")
+        selected=details.get("sel.first","sel.last")
+        cursor=details.index("insert")
+        initial_token=self.app._image_keys[self.app.camera_labels[0]][0]
+        deleted_bound=[]
+        original=ImageTk.PhotoImage.__del__
+        def delete(photo):
+            name=str(photo)
+            if any(str(label.cget("image"))==name for label in self.app.camera_labels):
+                deleted_bound.append(name)
+            original(photo)
+        with patch.object(self.app.start_button,"configure",wraps=self.app.start_button.configure) as configure, \
+             patch.object(self.app,"_layout_workspace",wraps=self.app._layout_workspace) as layout, \
+             patch.object(ImageTk.PhotoImage,"__del__",delete):
+            deadline=time.monotonic()+.7
+            while time.monotonic()<deadline:
+                self.root.update();time.sleep(.005)
+            self.assertEqual(configure.call_count,0)
+            self.assertEqual(layout.call_count,0)
+        self.assertEqual(deleted_bound,[])
+        self.assertGreater(self.app._image_keys[self.app.camera_labels[0]][0],initial_token)
+        self.assertEqual(details.index("@0,0"),top)
+        self.assertEqual(details.index("insert"),cursor)
+        self.assertEqual(details.get("sel.first","sel.last"),selected)
+        self.assertIn("Executing",self.app.status.get())
+        details.tag_remove("sel","1.0","end")
+        self.app.signal("success")
+        self.wait(lambda:session.state=="READY" and self.app.status.get().startswith("Ready"))
+        self.assertIsNone(self.app._progress_mode)
+        self.assertEqual(self.app.command_progress.get(),"")
+
+    def reference_fixture(self):
+        directory=Path(self.temporary.name)
+        for role,color in (("primary","red"),("wrist","blue")):
+            Image.new("RGB",(320,240),color).save(directory/f"{role}.png")
+        sample={"step":0,"primary":{"filename":"primary.png"},"wrist":{"filename":"wrist.png"}}
+        manifest=directory/"references.json"
+        manifest.write_text(json.dumps({"task":"CPU demo","instruction":"Run the mock deployment","episode_count":2,"samples":[sample,sample]}))
+        return str(manifest)
+
+    def test_training_examples_start_visible_and_have_a_direct_hide_and_restore_action(self):
+        self.launch(reference_manifest=self.reference_fixture())
+        self.root.deiconify();self.root.geometry("1366x768+0+0");self.settle_layout()
+        self.assertTrue(self.app.reference_enabled.get())
+        self.assertTrue(self.app.reference_panel.winfo_viewable())
+        self.assertGreaterEqual(self.app.reference_labels[0].winfo_height(),140)
+        self.app.reference_hide_button.invoke();self.settle_layout()
+        self.assertFalse(self.app.reference_panel.winfo_viewable())
+        self.assertTrue(self.app.reference_restore_button.winfo_viewable())
+        self.assertFalse(self.app.preferences.get("reference_visible"))
+        self.app.reference_restore_button.invoke();self.settle_layout()
+        self.assertTrue(self.app.reference_panel.winfo_viewable())
+        self.assertTrue(self.app.preferences.get("reference_visible"))
+
+    def test_training_examples_preserve_an_explicit_saved_hidden_choice(self):
+        preferences=Path(self.temporary.name)/"display.json"
+        preferences.write_text(json.dumps({"schema_version":1,"values":{"reference_visible":False}}))
+        self.launch(reference_manifest=self.reference_fixture(),preferences_path=preferences)
+        self.root.deiconify();self.settle_layout()
+        self.assertFalse(self.app.reference_enabled.get())
+        self.assertFalse(self.app.reference_panel.winfo_viewable())
+        self.assertTrue(self.app.reference_restore_button.winfo_viewable())
+
+    def test_video_preparation_owns_its_cancel_and_blocks_deletion_until_finished(self):
+        session=self.launch()
+        result=self.saved_rollout()
+        folder=session.folder/result["directory"]
+        video=folder/"primary.mp4"
+        original=b"mock recorded video; desktop worker is patched"
+        video.write_bytes(original)
+        entered=threading.Event()
+        observed={}
+        def prepare(path,**options):
+            observed.update(path=path,**options)
+            entered.set()
+            options["cancel"].wait(2)
+            raise RuntimeError("Opening cancelled")
+        with patch("gnaroshi_deployment.gui.open_local_path",side_effect=prepare), \
+             patch("gnaroshi_deployment.gui.messagebox.askyesno") as confirm:
+            self.assertTrue(self.app.open_result_video())
+            self.wait(entered.is_set)
+            self.app.refresh()
+            self.assertEqual(observed["cache_root"],folder/".runtime"/"playback")
+            self.assertEqual(str(self.app.delete_button.cget("state")),"disabled")
+            self.assertFalse(self.app.delete())
+            confirm.assert_not_called()
+            self.assertIn("Preparing",self.app.video_feedback.get())
+            self.assertEqual(video.read_bytes(),original)
+            self.app.close()
+            self.assertTrue(observed["cancel"].is_set())
+            self.app._playback_thread.join(2)
+            self.assertFalse(self.app._playback_thread.is_alive())
 
 
 if __name__ == "__main__":
