@@ -215,7 +215,7 @@ class CheckpointReload(unittest.TestCase):
         self.assertEqual(self.app.session.config.metadata["reload_selection"],
                          {"checkpoint": "checkpoint_b"})
 
-    def test_checkpoint_panel_is_collapsed_and_restores_result_space_after_load(self):
+    def test_policy_tab_keeps_results_available_and_returns_to_rollouts_after_load(self):
         old = self.make_session()
         self.app = DeploymentGUI(self.root, old, reload_fields=[
             {"key": "checkpoint", "label": "Checkpoint", "kind": "directory"},
@@ -228,7 +228,8 @@ class CheckpointReload(unittest.TestCase):
         self.root.geometry("1440x960")
         self.root.update()
         self.assertFalse(self.app._checkpoint_expanded)
-        self.assertFalse(self.app.checkpoint_panel.grid_info())
+        self.assertFalse(self.app.checkpoint_panel.winfo_ismapped())
+        self.assertEqual(self.app.tabs.select(), str(self.app.rollouts_tab))
         notebook = self.app.tabs
         for widget in (self.app.table, self.app.notes, self.app.details):
             tab = widget
@@ -240,19 +241,22 @@ class CheckpointReload(unittest.TestCase):
             self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(),
                                  self.root.winfo_rooty() + self.root.winfo_height())
         self.app.checkpoint_toggle.invoke()
-        self.root.update_idletasks()
+        self.root.update()
         self.assertTrue(self.app._checkpoint_expanded)
-        self.assertTrue(self.app.checkpoint_panel.grid_info())
+        self.assertTrue(self.app.checkpoint_panel.winfo_ismapped())
+        self.assertEqual(self.app.tabs.select(), str(self.app.policy_tab))
         self.app.checkpoint_toggle.invoke()
-        self.assertFalse(self.app.checkpoint_panel.grid_info())
+        self.root.update()
+        self.assertFalse(self.app.checkpoint_panel.winfo_ismapped())
         self.app.checkpoint_toggle.invoke()
         self.app.reload_vars["checkpoint"].set("checkpoint_b")
         self.assertTrue(self.app.load_checkpoint())
         self.assertFalse(self.app._checkpoint_expanded)
         self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
                   and not self.app._reload_in_progress)
-        self.root.update_idletasks()
-        self.assertFalse(self.app.checkpoint_panel.grid_info())
+        self.root.update()
+        self.assertFalse(self.app.checkpoint_panel.winfo_ismapped())
+        self.assertEqual(self.app.tabs.select(), str(self.app.rollouts_tab))
         self.assertEqual(self.app.reload_vars["checkpoint"].get(), "checkpoint_b")
         self.assertGreaterEqual(self.app.details.winfo_height(), 80)
 

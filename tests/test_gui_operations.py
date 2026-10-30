@@ -51,8 +51,16 @@ class GUIOperations(unittest.TestCase):
             time.sleep(.005)
         self.root.update()
 
-    def launch(self, *, embodiment=None, policy=None, selecting=False, **gui_options):
-        metadata = {"defer_policy_load": selecting}
+    def settle_layout(self):
+        # Tk resolves nested frames and an aspect-aware camera split over
+        # successive configure events, independently of the session worker.
+        deadline=time.monotonic()+.12
+        while time.monotonic()<deadline:
+            self.root.update()
+            time.sleep(.005)
+
+    def launch(self, *, embodiment=None, policy=None, selecting=False, config_metadata=None, **gui_options):
+        metadata = {"defer_policy_load": selecting,**(config_metadata or {})}
         config = SessionConfig(task="CPU demo", method="Mock · no hardware", output_root=self.temporary.name,
                                record_video=False, target_hz=200, metadata=metadata)
         session = DeploymentSession(config, policy or MockPolicy(.001), embodiment or MockEmbodiment(), Path(__file__).parents[1])
@@ -178,14 +186,14 @@ class GUIOperations(unittest.TestCase):
     def test_semantic_fonts_and_operator_zoom_change_actual_rendered_text(self):
         self.launch()
         score_font = tkfont.Font(root=self.root, font=self.app.style.lookup("Success.Score.TLabel", "font"))
-        self.assertEqual(score_font.actual("size"), 32)
+        self.assertEqual(score_font.actual("size"), 24)
         self.assertEqual(score_font.actual("weight"), "bold")
         self.assertEqual(self.app.fonts["body"].actual("size"), 14)
         self.app.set_text_size(21)
         self.root.update()
         note_font = tkfont.Font(root=self.root, font=self.app.notes.cget("font"))
         self.assertEqual(note_font.actual("size"), 21)
-        self.assertEqual(self.app.fonts["score"].actual("size"), 48)
+        self.assertEqual(self.app.fonts["score"].actual("size"), 24)
         self.assertGreaterEqual(self.app.style.lookup("Treeview", "rowheight"), note_font.metrics("linespace")+10)
         self.assertEqual(self.app.preferences.get("text_size"), 21)
         self.assertGreaterEqual(self.app.table.column("result","width"),self.app.fonts["body"].measure("success")+16)
@@ -216,11 +224,12 @@ class GUIOperations(unittest.TestCase):
             self.assertLessEqual(x+widget.winfo_width(), self.root.winfo_width(), str(widget))
             self.assertLessEqual(y+widget.winfo_height(), self.root.winfo_height(), str(widget))
         self.assertLessEqual(self.app.scoreboard.winfo_reqwidth(),self.root.winfo_width())
+        details_index=next(index for index,tab in enumerate(self.app.tabs.tabs()) if self.app.tabs.tab(tab,"text")=="Details")
         if self.app.view_picker.winfo_viewable():
-            self.app.view_picker.current(4)
+            self.app.view_picker.current(details_index)
             self.app.view_picker.event_generate("<<ComboboxSelected>>")
         else:
-            self.app.tabs.select(4)
+            self.app.tabs.select(self.app.details_tab)
         self.root.update()
         self.assertEqual(self.app.tabs.tab(self.app.tabs.select(), "text"), "Details")
 
@@ -376,8 +385,14 @@ class GUIOperations(unittest.TestCase):
         self.launch(selecting=True, reload_fields=fields, reload_factory=lambda *_args:None)
         self.root.geometry("1280x900+0+0")
         self.root.deiconify()
+        self.settle_layout()
+        self.assertEqual(self.app.tabs.tab(self.app.tabs.select(),"text"),"Policy")
+        camera_bounds=[(widget.winfo_rooty(),widget.winfo_height()) for widget in self.app.camera_labels]
+        self.app.tabs.select(self.app.rollouts_tab)
         self.root.update()
-        self.assertLess(self.app.checkpoint_panel.winfo_height(), 350)
+        self.app.tabs.select(self.app.policy_tab)
+        self.settle_layout()
+        self.assertEqual(camera_bounds,[(widget.winfo_rooty(),widget.winfo_height()) for widget in self.app.camera_labels])
         self.assertGreater(self.app.camera_labels[0].winfo_height(), 80)
         self.assertTrue(self.app.load_button.winfo_viewable())
         self.assertEqual(str(self.app.reload_widgets[0][0].cget("state")), "readonly")
@@ -413,7 +428,8 @@ class GUIOperations(unittest.TestCase):
         self.assertEqual(variable.get(),long_task)
         self.assertTrue(hint.winfo_viewable())
         self.assertGreater(hint.winfo_height(),self.app.fonts["caption"].metrics("linespace"))
-        self.assertGreater(float(self.app.workspace_canvas.cget("scrollregion").split()[3]),self.app.workspace_canvas.winfo_height())
+        form_canvas=self.app._selection_form.scroll_canvas
+        self.assertGreater(float(form_canvas.cget("scrollregion").split()[3]),form_canvas.winfo_height())
         self.assertTrue(self.app.load_button.winfo_viewable())
         self.assertGreaterEqual(self.app.workspace_canvas.winfo_height(),180)
         self.assertTrue(self.app.context_button.winfo_viewable())
@@ -431,6 +447,52 @@ class GUIOperations(unittest.TestCase):
         self.assertTrue(self.app.current_selection()["record_video"])
         self.assertEqual(session.embodiment.home_count, 0)
         self.assertEqual(session.embodiment.applied, [])
+
+    def test_compact_actions_are_pointer_reachable_and_policy_does_not_resize_cameras(self):
+        fields=[{"key":f"setting_{number}","label":f"Setting {number}","value":"draft","advanced":number>8}
+                for number in range(17)]
+        long_task="A deliberately long task title · 긴 실제 작업 이름도 보존"
+        session=self.launch(selecting=True,reload_fields=fields,reload_factory=lambda *_args:None,
+                            config_metadata={"display_task":long_task},
+                            config_loader=lambda *_args:{},config_saver=lambda *_args:None)
+        self.root.deiconify()
+        for width,height,size in ((1685,1376,12),(1366,768,14),(960,640,21),(960,640,24)):
+            with self.subTest(window=(width,height),text_size=size):
+                self.root.geometry(f"{width}x{height}+0+0")
+                self.app.set_text_size(size)
+                self.app.tabs.select(self.app.policy_tab)
+                self.settle_layout()
+                self.assertIn(long_task,self.app.instruction_label.cget("text"))
+                self.assertEqual(self.app.method_label.cget("text"),"No policy loaded")
+                if size==12:
+                    self.assertLessEqual(self.app.workspace_canvas.winfo_rooty()-self.root.winfo_rooty(),160)
+                    self.assertLessEqual(self.app.camera_labels[0].winfo_rooty()-self.root.winfo_rooty(),180)
+                if size==21:
+                    self.assertGreaterEqual(self.app.workspace_canvas.winfo_height(),280)
+                for button in self.app.run_buttons:
+                    self.assertEqual(button.winfo_width(),button.winfo_reqwidth())
+                    target=self.root.winfo_containing(button.winfo_rootx()+button.winfo_width()//2,
+                                                     button.winfo_rooty()+button.winfo_height()//2)
+                    self.assertIs(target,button,"A frame must not cover an apparently mapped action")
+                    self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),self.root.winfo_rootx()+width)
+                def cameras():
+                    return [(label.winfo_rootx(),label.winfo_rooty(),label.winfo_width(),label.winfo_height())
+                            for label in self.app.camera_labels]
+                before=cameras()
+                self.app._show_load_error("load failed","raw diagnostic is confined to Details")
+                self.settle_layout()
+                self.assertEqual(cameras(),before)
+                self.assertTrue(self.app.load_error.winfo_viewable())
+                self.assertTrue(self.app.load_button.winfo_viewable())
+                self.assertLessEqual(self.app.load_button.winfo_rooty()+self.app.load_button.winfo_height(),
+                                     self.app.workspace_canvas.winfo_rooty()+self.app.workspace_canvas.winfo_height())
+                self.assertNotIn("raw diagnostic",self.app.status.get())
+                self.app.tabs.select(self.app.rollouts_tab)
+                self.settle_layout()
+                self.assertEqual(cameras(),before)
+                self.assertLess(self.app.measurement_panel.winfo_height(),self.app.main_pane.winfo_height()/2)
+        self.assertEqual(session.embodiment.home_count,0)
+        self.assertEqual(session.embodiment.applied,[])
 
 
 if __name__ == "__main__":

@@ -117,7 +117,9 @@ Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5
 Success 이후 복귀 Home 오류는 이미 확정된 outcome을 바꾸지 않는다. 0개일 때 성공률은
 분모가 없으므로 `—`다. 다른 checkpoint를 Load하면 새 session의 집계를 보여주며 이전 결과는 보존한다.
 
-집계와 실행 조작은 스크롤 영역 밖에 유지한다. 카메라·참고 장면·결과/설정·notes의 경계는
+집계와 실행 조작은 스크롤 영역 밖에 유지한다. 실행/정지, 판정/재시도, 로봇 복구를
+자연스러운 버튼 너비의 세 그룹으로 배치하며 창이 좁으면 그룹 단위로 줄을 바꾼다.
+집계는 같은 toolbar에 표시한다. 카메라·참고 장면·결과/설정·notes의 경계는
 직접 끌어서 조절한다. 구분선에 Tab으로 focus를 주고 Arrow / Shift+Arrow로 크기를 바꾸거나
 Home/End로 범위 끝, Enter 또는 더블클릭으로 기본 비율을 복원한다. 지원하는 pane은 숨김·펼침이
 가능하며 다시 펼치는 조작은 접근 가능한 위치에 남는다. 좁은 창에서의 clamp는 넓은 창에 저장한
@@ -129,11 +131,15 @@ Ctrl+0으로 기본값을 복원한다. 제목·본문·보조문구·수치는 
 글꼴이 있어야 한다. semantic token의 원본은 gui.py의 THEME/SPACE와 font 역할이고, pane 동작과
 local presentation persistence는 workspace.py에서 관리한다.
 큰 글자로 낮은 창을 사용할 때는 긴 instruction과 policy 설명을 **Context**에서 펼쳐 볼 수 있다.
-집계는 같은 줄의 큰 숫자로 압축하고 실행 조작은 유지해 카메라와 결과 작업 영역을 확보한다.
+Policy 설정은 오른쪽 inspector에서 편집하므로 폼이나 로드 오류가 카메라를 아래로 밀지 않는다.
+측정값은 내용에 필요한 높이만 사용한다. Settings의 **Show training reference**로 참고 장면을
+펼칠 수 있고, 표시 여부도 저장한다. 상단 **Inspector**는 오른쪽 작업 영역을 숨기거나 펼친다.
 **Save notes [W]**는 Notes에, 확인 후 삭제하는 **Delete last [D]**는 Rollouts에 둔다.
 설정 입력칸으로 Tab 이동하면 중첩된 스크롤 영역도 해당 입력칸을 보이도록 따라간다.
 
-글자·창·pane 배치는 local UI preferences에 보관한다. 실험 결과와 checkpoint 설정을 바꾸지 않는다.
+글자·창·pane 배치는 local UI preferences에 보관한다. 글자 크기는 선택 즉시 저장하므로
+checkpoint 교체나 다음 실행에서도 마지막 값을 복원한다. 저장하지 못하면 Settings에 오류를
+표시하며 기존 파일은 보존한다. 실험 결과와 checkpoint 설정을 바꾸지 않는다.
 caller는 DeploymentGUI의 optional preferences_path 또는 config.metadata의 ui_preferences_path로
 경로를 지정할 수 있다. config_directory가 있으면 그 부모의 ui_preferences.json을 사용하고,
 없으면 output_root 아래 ignored .ui_preferences.json을 사용한다. 설정 파일은 Git에 넣지 않는다.
@@ -160,8 +166,9 @@ DeploymentGUI(root, session,
 
 `kind`는 `directory`, `file`, `text`, `choice`를 지원한다. 초기 선택은
 `config.metadata['reload_selection']`이 우선하며 각 field의 `value`가 기본값이다.
-선택 패널은 기본으로 접혀 있으며 헤더의 `Task / checkpoint...`로 펼친다. Load 요청을 수락하면
-다시 접어 결과표·notes 공간을 확보한다. 로드 오류는 패널을 열어 전체 traceback을 보여주며
+헤더의 **Policy**로 inspector의 Policy 탭을 연다. Load 요청을 수락하면 Rollouts 탭으로
+돌아간다. Load 버튼은 긴 설정 폼의 스크롤 밖에 둔다. 로드 오류는 Policy 탭에 요약을,
+Details에 전체 진단 정보를 보여주며
 선택값과 오류를 해당 세션의 `events.jsonl`에도 기록한다.
 factory는 선택한 checkpoint/method를 config와 policy metadata에 명시하고, 필요한 경우
 checkpoint별 `output_root`를 정한다. factory에서 세션을 `start()`하지 않는다.

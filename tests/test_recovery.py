@@ -481,11 +481,18 @@ class RecoveryGUI(unittest.TestCase):
                     time.sleep(.005)
             try:
                 wait(lambda: session.state == "READY")
+                root.geometry("1280x900")
+                root.deiconify()
+                root.update()
                 embodiment.fault_at = "apply"
                 app.start()
                 wait(lambda: session.can_recover)
                 app.refresh()
-                self.assertTrue(app.recover_button.grid_info())
+                root.update()
+                self.assertTrue(app.recover_button.winfo_ismapped())
+                self.assertEqual(str(app.recover_button.cget("state")), "normal")
+                self.assertLessEqual(app.recover_button.winfo_rooty() + app.recover_button.winfo_height(),
+                                     root.winfo_rooty() + root.winfo_height())
                 self.assertEqual(str(app.start_button.cget("state")), "disabled")
                 self.assertEqual(str(app.success_button.cget("state")), "disabled")
                 embodiment.released = True
