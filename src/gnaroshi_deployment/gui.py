@@ -390,7 +390,8 @@ class DeploymentGUI:
         self.score_context = ttk.Frame(self.scoreboard)
         self.score_context.pack(side="left",padx=(0,SPACE["control"]))
         self.score_scope = tk.StringVar(value="Saved in this session")
-        ttk.Label(self.score_context,text="Session",style="Caption.TLabel").pack(anchor="w")
+        self.score_scope_label=ttk.Label(self.score_context,text="Session",style="Caption.TLabel")
+        self.score_scope_label.pack(anchor="w")
         self.automatic_count = tk.StringVar(value="Automatic failures: 0")
         self.automatic_display = tk.StringVar(value="Automatic failures: 0")
         self.automatic_count_label = ttk.Label(self.score_context,textvariable=self.automatic_display,style="Caption.TLabel")
@@ -417,6 +418,10 @@ class DeploymentGUI:
         self.automatic_count.set(f"Automatic failures: {automatic}")
         self.automatic_display.set(f"Auto {automatic}" if getattr(self,"_compact_counts",False) else self.automatic_count.get())
         self.counts.set(f"Success {successes}  ·  Failure {failures}  ·  SR {rate}")
+        values=(successes,failures,total,rate,automatic)
+        if values!=getattr(self,"_scoreboard_layout_seen",None):
+            self._scoreboard_layout_seen=values
+            self._schedule_layout()
 
     def set_text_size(self, value):
         value = max(12, min(24, int(value)))
@@ -478,7 +483,7 @@ class DeploymentGUI:
         width, height = self.workspace_canvas.winfo_width(), self.workspace_canvas.winfo_height()
         # Each inspector form owns its scrolling. Inflating this outer canvas
         # would move the fixed policy actions below the visible workspace.
-        content_height = max(height, 220)
+        content_height = max(1,height)
         self.workspace_canvas.itemconfigure(self._workspace_window,width=max(1,width),height=content_height)
         self.workspace_canvas.configure(scrollregion=(0,0,max(1,width),content_height))
         if content_height>height:
@@ -557,13 +562,30 @@ class DeploymentGUI:
         self.fonts["score"].configure(size=max(self.text_size,min(24,round(self.text_size*24/14))))
         self._compact_counts = available<1200 and self.text_size>18
         self.automatic_display.set(self.automatic_count.get().replace("Automatic failures:","Auto") if self._compact_counts else self.automatic_count.get())
-        for key in self.score_cells:
-            self.score_labels[key].pack_configure(side="top" if self._compact_counts else "left")
-            self.score_captions[key].pack_configure(side="top" if self._compact_counts else "left",padx=0 if self._compact_counts else (SPACE["small"],0))
         self.score_captions["failure"].configure(text="Fail" if self._compact_counts else "Failure")
+        group_widths=[group.winfo_reqwidth() for group in self.action_groups]
+        final_row=final_used=0
+        for requested in group_widths:
+            if final_used and final_used+requested>available:
+                final_row+=1
+                final_used=0
+            final_used+=requested+SPACE["section"]
+        stacked_width=(max(self.score_scope_label.winfo_reqwidth(),self.automatic_count_label.winfo_reqwidth())
+                       +SPACE["control"]+sum(max(self.score_labels[key].winfo_reqwidth(),caption.winfo_reqwidth())
+                       +SPACE["group"] for key,caption in self.score_captions.items()))
+        stacked_counts=self._compact_counts and final_row>0 and final_used+stacked_width<=available
+        # Larger text and wider native glyphs may leave no room beside Home /
+        # Recover. A single-line strip keeps every count readable without
+        # adding a tall third band above the camera and policy form.
+        inline_scope=self._compact_counts and not stacked_counts
+        self.score_scope_label.pack_configure(side="left" if inline_scope else "top",anchor="w")
+        self.automatic_count_label.pack_configure(side="left" if inline_scope else "top",anchor="w",
+                                                   padx=(SPACE["control"],0) if inline_scope else 0)
+        for key in self.score_cells:
+            self.score_labels[key].pack_configure(side="top" if stacked_counts else "left")
+            self.score_captions[key].pack_configure(side="top" if stacked_counts else "left",padx=0 if stacked_counts else (SPACE["small"],0))
         # Controls stay in three task groups. Their natural widths, not seven
         # stretched cells, determine where a coherent group wraps.
-        group_widths=[group.winfo_reqwidth() for group in self.action_groups]
         score_width=self.scoreboard.winfo_reqwidth()
         controls_width=sum(group_widths)+2*SPACE["section"]
         combined=controls_width+score_width+SPACE["section"]<=available
@@ -1014,7 +1036,9 @@ class DeploymentGUI:
             self._schedule_preferences()
 
     def _checkpoint_panel(self, parent):
-        self.checkpoint_panel = panel = ttk.Frame(parent, padding=SPACE["control"])
+        # The Policy tab and scroll form already supply their own insets.
+        # A third padded container needlessly consumes input space at zoom.
+        self.checkpoint_panel = panel = ttk.Frame(parent)
         panel.grid(row=0, column=0, sticky="nsew")
         panel.rowconfigure(0,weight=1)
         panel.columnconfigure(0, weight=1)

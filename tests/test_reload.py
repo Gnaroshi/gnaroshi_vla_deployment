@@ -409,7 +409,9 @@ class CheckpointReload(unittest.TestCase):
         self.wait(lambda: self.app.session is not old and self.app.session.state == "READY"
                   and not self.app._reload_in_progress)
         self.assertEqual(self.app.session.config.task, "second_task")
-        self.assertEqual(self.app.instruction_label.cget("text"), "Run another mock task")
+        context = self.app.instruction_label.cget("text")
+        self.assertIn("Second Task", context)
+        self.assertIn("Run another mock task", context)
         self.assertIn("second_task", self.root.title())
         self.assertTrue(old.replacement_closed)
 

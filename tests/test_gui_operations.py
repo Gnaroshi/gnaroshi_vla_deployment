@@ -494,6 +494,40 @@ class GUIOperations(unittest.TestCase):
         self.assertEqual(session.embodiment.home_count,0)
         self.assertEqual(session.embodiment.applied,[])
 
+    def test_saved_success_counts_reflow_at_maximum_text_without_hiding_policy_actions(self):
+        fields=[{"key":f"setting_{number}","label":f"Setting {number}","value":"draft","advanced":number>8}
+                for number in range(17)]
+        session=self.launch(reload_fields=fields,reload_factory=lambda *_args:None)
+        self.root.deiconify()
+        self.root.geometry("960x640+0+0")
+        self.app.set_text_size(24)
+        self.settle_layout()
+        for number in range(12):
+            self.app.start()
+            self.wait(lambda: session.state=="RUNNING" and len(session.rows)>=2)
+            self.app.signal("success")
+            self.wait(lambda: session.state=="READY" and len(session.results)==number+1)
+        self.wait(lambda:self.app.score_vars["success"].get()=="12")
+        self.app.tabs.select(self.app.policy_tab)
+        self.app.toggle_advanced_fields()
+        self.settle_layout()
+        self.assertEqual(self.app.score_vars["success"].get(),"12")
+        self.assertEqual(self.app.score_vars["rate"].get(),"100.0%")
+        canvas=self.app.workspace_canvas
+        self.assertEqual(self.app.workspace_content.winfo_height(),canvas.winfo_height())
+        self.assertLessEqual(self.app.load_button.winfo_rooty()+self.app.load_button.winfo_height(),
+                             canvas.winfo_rooty()+canvas.winfo_height())
+        for widget in (*self.app.score_labels.values(),self.app.automatic_count_label):
+            self.assertLessEqual(widget.winfo_rootx()+widget.winfo_width(),self.root.winfo_rootx()+self.root.winfo_width())
+        last=self.app.reload_widgets[-1][0]
+        last.focus_force()
+        self.settle_layout()
+        viewport=self.app._selection_form.scroll_canvas
+        self.assertGreaterEqual(viewport.winfo_height(),last.winfo_reqheight())
+        self.assertGreaterEqual(last.winfo_rooty(),viewport.winfo_rooty())
+        self.assertLessEqual(last.winfo_rooty()+last.winfo_height(),viewport.winfo_rooty()+viewport.winfo_height())
+        self.assertEqual(len(session.results),12)
+
 
 if __name__ == "__main__":
     unittest.main()
