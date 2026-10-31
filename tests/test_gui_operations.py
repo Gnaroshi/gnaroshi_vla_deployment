@@ -348,6 +348,141 @@ class GUIOperations(unittest.TestCase):
         self.assertEqual(saved["successes"], 2)
         self.assertEqual(saved["failures"], 0)
 
+    def test_saved_rows_follow_new_results_but_preserve_scroll_selection_and_home_updates(self):
+        session=self.launch()
+        self.root.deiconify()
+        self.root.geometry("1440x960+0+0")
+        with session.lock:
+            session.results[:]=[{"id":number,"outcome":"success","steps":12,"achieved_command_hz":30.,
+                                "outcome_home":"pending"} for number in range(1,41)]
+        self.app.refresh()
+        self.settle_layout()
+        self.assertEqual(self.app.table.selection(),("rollout_40",))
+        self.assertTrue(self.app.table.bbox("rollout_40"))
+        self.app.table.selection_set("rollout_3")
+        self.app.table.yview_moveto(0)
+        self.app.show_result_note()
+        position=self.app.table.yview()
+        with session.lock:
+            session.results[2]["outcome_home"]="completed"
+        self.app.refresh()
+        self.assertEqual(self.app.table.selection(),("rollout_3",))
+        self.assertEqual(self.app.table.yview(),position)
+        self.assertIn("Return home: completed",self.app.result_summary.get())
+        with session.lock:
+            session.results.append({"id":41,"outcome":"failure","steps":4,"achieved_command_hz":20.})
+        self.app.refresh()
+        self.root.update()
+        self.assertEqual(self.app.table.selection(),("rollout_41",))
+        self.assertTrue(self.app.table.bbox("rollout_41"))
+
+    def test_multiline_annotation_keeps_shortcuts_and_pending_draft_safe_on_new_result(self):
+        session=self.launch()
+        first=self.saved_rollout()
+        self.assertIsInstance(self.app.annotation_entry,tk.Text)
+        self.app.annotation_entry.insert("1.0","Grasp succeeded.\nRelease timing needs review.")
+        self.root.update()
+        self.assertEqual(self.app.result_annotation.get(),"Grasp succeeded.\nRelease timing needs review.")
+        self.app.keypress(SimpleNamespace(keysym="w",widget=self.app.annotation_entry,state=0))
+        self.assertNotIn("w",self.app._shortcut_down)
+        self.saved_rollout()
+        self.assertEqual(session.results[0]["operator_note"],"Grasp succeeded.\nRelease timing needs review.")
+        self.assertEqual(self.app.annotation_entry.get("1.0","end-1c"),"")
+        self.assertEqual(first["outcome"],"success")
+        self.root.deiconify()
+        self.app.table.selection_set(f"rollout_{first['id']}")
+        self.app.show_result_note()
+        self.app.annotation_entry.focus_force()
+        self.root.update()
+        self.app.annotation_entry.insert("end","\nKeep editing the first rollout.")
+        self.app.annotation_entry.mark_set("insert","1.5")
+        text=self.app.annotation_entry.get("1.0","end-1c")
+        self.saved_rollout()
+        self.assertEqual(self.app.table.selection(),(f"rollout_{first['id']}",))
+        self.assertEqual(self.app._annotation_result_id,first["id"])
+        self.assertEqual(self.app.annotation_entry.get("1.0","end-1c"),text)
+        self.assertEqual(self.app.annotation_entry.index("insert"),"1.5")
+        self.assertIs(self.root.focus_get(),self.app.annotation_entry)
+        self.assertEqual(session.results[0]["operator_note"],text)
+        self.assertFalse(session.results[-1].get("operator_note"))
+        self.assertTrue(self.app.table.bbox(self.app.table.get_children()[-1]))
+
+    def test_numbering_preference_defaults_continuous_persists_and_applies_to_replacement(self):
+        session=self.launch(reload_fields=[{"key":"task","label":"Task","value":"CPU demo"}],reload_factory=lambda *_args:None)
+        self.assertTrue(session.continuous_rollout_indices)
+        self.app.continuous_rollout_indices.set(False)
+        self.assertTrue(self.app.set_rollout_numbering())
+        self.assertFalse(session.continuous_rollout_indices)
+        saved=json.loads(self.app.preferences.path.read_text())
+        self.assertFalse(saved["values"]["continuous_rollout_indices"])
+        self.app.start()
+        self.wait(lambda:session.state=="RUNNING")
+        self.app.refresh()
+        self.assertEqual(str(self.app.numbering_toggle.cget("state")),"disabled")
+        self.app.continuous_rollout_indices.set(True)
+        self.assertFalse(self.app.set_rollout_numbering())
+        self.assertFalse(self.app.continuous_rollout_indices.get())
+        self.app.signal("stop")
+        self.wait(lambda:session.state=="READY")
+        session.close();session.worker.join(3)
+        replacement=DeploymentSession(SessionConfig(task="Replacement",method="Mock",output_root=self.temporary.name,record_video=False),
+                                      MockPolicy(.001),MockEmbodiment(),Path(__file__).parents[1])
+        self.app._bind_session(replacement)
+        self.assertFalse(replacement.continuous_rollout_indices)
+        self.wait(lambda:replacement.state=="READY")
+
+    def test_result_pane_resizes_by_pointer_and_keyboard_and_preserves_split(self):
+        self.launch()
+        self.root.deiconify();self.root.geometry("1440x960+0+0")
+        self.settle_layout()
+        pane=self.app.result_pane
+        before=pane.second.winfo_height()
+        pane.separator.event_generate("<ButtonPress-1>",x=5,y=5)
+        pane.separator.event_generate("<B1-Motion>",x=5,y=-65)
+        pane.separator.event_generate("<ButtonRelease-1>",x=5,y=-65)
+        self.settle_layout()
+        self.assertGreater(pane.second.winfo_height(),before+30)
+        fraction=pane.preferences.pane("rollout_details")["fractions"]["vertical"]
+        pane.separator.focus_force()
+        pane.separator.event_generate("<KeyPress-Up>")
+        self.settle_layout()
+        self.assertLess(pane.preferences.pane("rollout_details")["fractions"]["vertical"],fraction)
+        self.app._save_preferences()
+        saved=json.loads(self.app.preferences.path.read_text())
+        self.assertEqual(saved["values"]["panes"]["rollout_details"],pane.preferences.pane("rollout_details"))
+        self.assertLess(self.app.status_bar.winfo_y(),self.app.heading.winfo_y())
+        self.assertEqual(self.app.exit_button.cget("style"),"Destructive.TButton")
+        tools=(self.app.open_video_button,self.app.open_result_button,self.app.copy_result_button)
+        self.assertEqual(len({button.winfo_rooty() for button in tools}),1)
+
+    def test_short_window_keeps_results_and_annotation_reachable_without_clipping_controls(self):
+        self.launch()
+        self.root.deiconify()
+        self.saved_rollout()
+        self.root.geometry("960x640+0+0")
+        self.app.set_text_size(21)
+        self.settle_layout()
+        self.saved_rollout()
+        self.settle_layout()
+        canvas=self.app.results_canvas
+        latest=self.app.table.bbox(self.app.table.get_children()[-1])
+        self.assertTrue(latest)
+        latest_top=self.app.table.winfo_rooty()+latest[1]
+        self.assertGreaterEqual(latest_top,canvas.winfo_rooty())
+        self.assertLessEqual(latest_top+latest[3],canvas.winfo_rooty()+canvas.winfo_height())
+        self.assertGreater(self.app.results_content.winfo_height(),canvas.winfo_height())
+        self.assertGreaterEqual(self.app.table.winfo_height(),120)
+        self.assertGreaterEqual(self.app.annotation_entry.winfo_height(),2*self.app.fonts["body"].metrics("linespace"))
+        canvas.yview_moveto(0)
+        self.root.update()
+        for button in (self.app.open_video_button,self.app.open_result_button,self.app.copy_result_button):
+            self.assertGreaterEqual(button.winfo_width(),button.winfo_reqwidth())
+        canvas.yview_moveto(1)
+        self.root.update()
+        self.assertLessEqual(self.app.annotation_entry.winfo_rooty()+self.app.annotation_entry.winfo_height(),
+                             canvas.winfo_rooty()+canvas.winfo_height())
+        self.assertLess(self.app.annotation_entry.winfo_rooty(),canvas.winfo_rooty()+canvas.winfo_height())
+
     def test_record_browser_opens_only_selected_contained_paths_and_handles_missing_video(self):
         session = self.launch()
         result = self.saved_rollout()
@@ -643,14 +778,90 @@ class GUIOperations(unittest.TestCase):
         self.assertIsNone(self.app._progress_mode)
         self.assertEqual(self.app.command_progress.get(),"")
 
-    def reference_fixture(self):
-        directory=Path(self.temporary.name)
-        for role,color in (("primary","red"),("wrist","blue")):
+    def reference_fixture(self,task="CPU demo",instruction="Run the mock deployment",folder="",primary="red"):
+        directory=Path(self.temporary.name)/folder
+        directory.mkdir(parents=True,exist_ok=True)
+        for role,color in (("primary",primary),("wrist","blue")):
             Image.new("RGB",(320,240),color).save(directory/f"{role}.png")
         sample={"step":0,"primary":{"filename":"primary.png"},"wrist":{"filename":"wrist.png"}}
         manifest=directory/"references.json"
-        manifest.write_text(json.dumps({"task":"CPU demo","instruction":"Run the mock deployment","episode_count":2,"samples":[sample,sample]}))
+        manifest.write_text(json.dumps({"task":task,"instruction":instruction,"episode_count":2,"samples":[sample,sample]}))
         return str(manifest)
+
+    def reference_selection(self,task,manifest):
+        return {"task":task,"reference_manifest":manifest,
+                "resolved_config":{"task":task,"instruction":f"Do {task}"}}
+
+    def test_training_examples_follow_task_selection_without_loading_policy(self):
+        manifests={task:self.reference_fixture(task,f"Do {task}",task,color)
+                   for task,color in (("first","red"),("second","green"))}
+        policy=MockPolicy()
+        def resolve(selected,key):
+            return self.reference_selection(selected["task"],manifests[selected["task"]])
+        with patch.object(policy,"connect") as connect:
+            session=self.launch(selecting=True,policy=policy,
+                reload_fields=[{"key":"task","kind":"choice","choices":["first","second"]}],
+                reload_factory=lambda *_:self.fail("Looking at examples must not build a model"),
+                selection_resolver=resolve)
+            original=(session.config.task,session.config.instruction,session.config.reference_manifest)
+            self.root.deiconify();self.root.geometry("1366x768+0+0")
+            for task,color in (("first",(255,0,0)),("second",(0,128,0))):
+                self.app.reload_vars["task"].set(task)
+                self.assertTrue(self.app.resolve_selection("task"))
+                self.settle_layout();self.app.refresh()
+                self.assertTrue(self.app.reference_panel.winfo_viewable())
+                self.assertIn(task,self.app.reference_title.cget("text"))
+                self.assertEqual(self.app.catalog.index,0)
+                photo=self.app._image_photos[self.app.reference_labels[0]]
+                self.assertEqual(ImageTk.getimage(photo).convert("RGB").getpixel((1,1)),color)
+                self.assertEqual(session.state,"SELECTING")
+                self.assertEqual((session.config.task,session.config.instruction,session.config.reference_manifest),original)
+                self.assertEqual(session.embodiment.applied,[])
+            connect.assert_not_called()
+
+    def test_training_examples_initial_draft_is_visible_before_policy_load(self):
+        manifest=self.reference_fixture("first","Do first","first")
+        self.launch(selecting=True,config_metadata={"reload_selection":self.reference_selection("first",manifest)})
+        self.root.deiconify();self.settle_layout()
+        self.assertTrue(self.app.reference_panel.winfo_viewable())
+        self.assertEqual(self.app.catalog.path,Path(manifest).resolve())
+        self.assertIn("first (selected)",self.app.reference_title.cget("text"))
+
+    def test_training_examples_missing_and_corrupt_manifest_have_visible_error(self):
+        self.launch(selecting=True)
+        self.root.deiconify()
+        corrupt=Path(self.temporary.name)/"corrupt.json"
+        corrupt.write_text("{broken")
+        unreadable=self.reference_fixture("first","Do first","unreadable")
+        (Path(unreadable).parent/"primary.png").write_bytes(b"invalid image")
+        mismatch=self.reference_fixture("another task","Do another task","mismatch")
+        for manifest in (None,str(Path(self.temporary.name)/"missing.json"),str(corrupt),unreadable,mismatch):
+            self.app._apply_selection(self.reference_selection("first",manifest))
+            self.settle_layout();self.app.refresh()
+            self.assertIsNone(self.app.catalog)
+            self.assertTrue(self.app.reference_notice.winfo_viewable())
+            self.assertIn("first",self.app.reference_notice.cget("text"))
+            self.assertTrue(self.app._reference_error)
+            self.assertFalse(self.app.reference_panel.winfo_viewable())
+        valid=self.reference_fixture("first","Do first","first")
+        self.app._apply_selection(self.reference_selection("first",valid))
+        self.settle_layout()
+        self.assertTrue(self.app.reference_panel.winfo_viewable())
+        self.assertFalse(self.app.reference_notice.winfo_viewable())
+
+    def test_training_examples_selection_preserves_explicit_hidden_preference(self):
+        preferences=Path(self.temporary.name)/"display.json"
+        preferences.write_text(json.dumps({"schema_version":1,"values":{"reference_visible":False}}))
+        self.launch(selecting=True,preferences_path=preferences)
+        self.root.deiconify()
+        manifest=self.reference_fixture("first","Do first","first")
+        self.app._apply_selection(self.reference_selection("first",manifest))
+        self.settle_layout()
+        self.assertFalse(self.app.reference_panel.winfo_viewable())
+        self.assertTrue(self.app.reference_restore_button.winfo_viewable())
+        self.assertFalse(self.app.preferences.get("reference_visible"))
+        self.app.reference_restore_button.invoke();self.settle_layout()
+        self.assertTrue(self.app.reference_panel.winfo_viewable())
 
     def test_training_examples_start_visible_and_have_a_direct_hide_and_restore_action(self):
         self.launch(reference_manifest=self.reference_fixture())

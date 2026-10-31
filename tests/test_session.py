@@ -9,7 +9,7 @@ from unittest.mock import patch
 import numpy as np
 from gnaroshi_deployment.adapters.mock import MockEmbodiment,MockPolicy
 from gnaroshi_deployment.adapters.ur5e import UR5eConfig,UR5eEmbodiment
-from gnaroshi_deployment.contracts import SessionConfig,Observation
+from gnaroshi_deployment.contracts import SessionConfig,Observation,RobotRecoveryRequired
 from gnaroshi_deployment.records import RolloutRecorder,summary
 from gnaroshi_deployment.session import DeploymentSession
 
@@ -73,6 +73,100 @@ class Sessions(unittest.TestCase):
         session.delete_previous()
         self.assertEqual(len(session.results),1)
         self.assertEqual(len(list(session.folder.glob("rollout_*"))),1)
+
+    def test_discarded_attempts_do_not_consume_saved_numbers_by_default(self):
+        session=self.make(steps=1)
+        for outcome in ("success","stop","retry","failure"):
+            self.assertTrue(session.start_rollout())
+            self.wait(lambda:session.state=="WAITING_OUTCOME")
+            self.assertFalse(session.set_continuous_rollout_indices(False))
+            session.signal(outcome)
+            self.wait(lambda:session.state=="READY")
+        self.assertTrue(session.continuous_rollout_indices)
+        self.assertEqual([r["id"] for r in session.results],[1,2])
+        self.assertEqual([r["attempt_id"] for r in session.results],[1,4])
+        self.assertEqual([Path(r["directory"]).name.split("_")[1] for r in session.results],["0001","0002"])
+        events=[json.loads(line) for line in (session.folder/"events.jsonl").read_text().splitlines()]
+        self.assertEqual([e["attempt_id"] for e in events if e["event"]=="discard_rollout"],[2,3])
+
+    def test_numbering_option_preserves_attempt_gaps_without_renumbering_results(self):
+        session=self.make(steps=1)
+        self.assertTrue(session.set_continuous_rollout_indices(False))
+        for outcome in ("success","retry","failure"):
+            session.start_rollout()
+            self.wait(lambda:session.state=="WAITING_OUTCOME")
+            session.signal(outcome)
+            self.wait(lambda:session.state=="READY")
+        self.assertEqual([r["id"] for r in session.results],[1,3])
+        self.assertTrue(session.set_continuous_rollout_indices(True))
+        session.start_rollout()
+        self.wait(lambda:session.state=="WAITING_OUTCOME")
+        session.signal("success")
+        self.wait(lambda:session.state=="READY")
+        self.assertEqual([r["id"] for r in session.results],[1,3,4])
+        manifest=json.loads((session.folder/"manifest.json").read_text())
+        self.assertTrue(manifest["config"]["metadata"]["continuous_rollout_indices"])
+
+    def test_numbering_toggle_and_deletion_keep_accepted_paths_and_unique_attempts(self):
+        session=self.make(steps=1)
+        def attempt(outcome):
+            session.start_rollout()
+            self.wait(lambda:session.state=="WAITING_OUTCOME")
+            session.signal(outcome)
+            self.wait(lambda:session.state=="READY")
+        attempt("stop")
+        attempt("success")
+        first=dict(session.results[0])
+        self.assertTrue(session.set_continuous_rollout_indices(False))
+        attempt("retry")
+        attempt("success")
+        self.assertEqual([r["id"] for r in session.results],[1,4])
+        removed=session.results[-1]["directory"]
+        self.assertTrue(session.delete_previous())
+        self.assertFalse((session.folder/removed).exists())
+        self.assertTrue(session.set_continuous_rollout_indices(True))
+        attempt("failure")
+        self.assertEqual([r["id"] for r in session.results],[1,2])
+        self.assertEqual([r["attempt_id"] for r in session.results],[2,5])
+        self.assertEqual(session.results[0],first)
+        self.assertNotEqual(session.results[-1]["directory"],removed)
+        self.assertEqual(len(list(session.folder.glob("rollout_*"))),2)
+
+    def test_outcome_home_reports_are_saved_and_motion_stopped_before_ready(self):
+        class ReportedHome(MockEmbodiment):
+            def home(self,cancel):
+                super().home(cancel)
+                self._episode_active=True
+                return {"verified":True,"actual_joints":[0.0]*6,"gripper_position":3}
+        session=self.make(embodiment=ReportedHome(),steps=1)
+        session.start_rollout()
+        self.wait(lambda:session.state=="WAITING_OUTCOME")
+        session.signal("success")
+        self.wait(lambda:session.state=="READY")
+        result=session.results[0]
+        self.assertEqual(result["outcome_home"],"completed")
+        self.assertEqual(result["start_home_report"]["gripper_position"],3)
+        self.assertTrue(result["outcome_home_report"]["verified"])
+        self.assertTrue(result["outcome_home_stop_confirmed"])
+        self.assertFalse(session.embodiment._episode_active)
+
+    def test_unreached_outcome_home_preserves_success_and_requires_recovery(self):
+        class UnreachedHome(MockEmbodiment):
+            def home(self,cancel):
+                if self.home_count:
+                    raise RobotRecoveryRequired("Home target not reached",category="home_position_unconfirmed",
+                                                status={"max_joint_error_rad":.4})
+                return super().home(cancel)
+        session=self.make(embodiment=UnreachedHome(),steps=1)
+        session.start_rollout()
+        self.wait(lambda:session.state=="WAITING_OUTCOME")
+        session.signal("success")
+        self.wait(lambda:session.state=="RECOVERY_REQUIRED")
+        result=session.results[0]
+        self.assertEqual(result["outcome"],"success")
+        self.assertEqual(result["outcome_home"],"error")
+        self.assertEqual(result["outcome_home_failure"]["category"],"home_position_unconfirmed")
+        self.assertFalse(session.start_rollout())
 
     def test_stop_during_inference_never_applies_late_action_or_homes(self):
         entered,release=threading.Event(),threading.Event()
@@ -540,6 +634,155 @@ class HardwareContract(unittest.TestCase):
             self.assertTrue(np.array_equal(encoded[30],blue))
             segments=[json.loads(line) for line in (recorder.folder/"frames.jsonl").read_text().splitlines() if json.loads(line)["kind"]=="video_frames"]
             self.assertEqual([(s["source_step"],s["video_frame_start"],s["video_frame_end_exclusive"]) for s in segments],[(0,0,30),(1,30,31)])
+
+
+class VerifiedUR5eHome(unittest.TestCase):
+    """Actual feedback, not acknowledged targets, determines readiness."""
+    class ClockCancel:
+        def __init__(self):
+            self.now=0.0
+            self.cancelled=False
+        def is_set(self):return self.cancelled
+        def wait(self,seconds):
+            self.now+=max(seconds,.001)
+            return self.cancelled
+
+    def make(self,*,follow=True,opening=True):
+        env=UR5eEmbodiment(ur5e_config(home_joints=(.2,)*6,home_duration_s=.2,
+            home_hz=10,home_settle_timeout_s=.3,gripper_open_timeout_s=.1))
+        class Receive(HealthyRobot):
+            q=np.zeros(6)
+            def getActualQ(self):return self.q.copy()
+        receive=Receive()
+        class Control(HealthyRobot):
+            def __init__(self):self.calls=[]
+            def initPeriod(self):return None
+            def waitPeriod(self,token):pass
+            def servoJ(self,joints,velocity,acceleration,duration,lookahead,gain):
+                self.calls.append((list(joints),duration))
+                if follow:receive.q=np.asarray(joints)
+                return True
+            def servoStop(self):return True
+        class Gripper:
+            def __init__(self):self.position=255;self.commands=[]
+            def activate(self,*args):pass
+            def move(self,position,*args):
+                self.commands.append(position)
+                if opening:self.position=3
+            def get(self,name):return self.position
+            def halt(self):pass
+        env.control,env.receive,env.gripper=Control(),receive,Gripper()
+        return env
+
+    def test_cached_open_target_still_reopens_and_verifies_measured_position(self):
+        env=self.make()
+        env.last_gripper_position=0
+        env.gripper_status="close"
+        cancel=self.ClockCancel()
+        with patch("gnaroshi_deployment.adapters.ur5e.time.monotonic",lambda:cancel.now):
+            report=env.home(cancel)
+        self.assertEqual(env.gripper.commands,[0])
+        self.assertEqual(report["gripper_position"],3)
+        self.assertTrue(report["verified"])
+        self.assertLessEqual(report["max_joint_error_rad"],.01)
+        self.assertTrue(all(duration==.1 for _,duration in env.control.calls))
+        self.assertEqual(env.config.servo_time_s,.002)
+        self.assertFalse(env.armed.is_set())
+
+    def test_acknowledged_servo_without_actual_movement_cannot_complete_home(self):
+        env=self.make(follow=False)
+        env.metadata["last_home_report"]={"verified":True,"stale":True}
+        cancel=self.ClockCancel()
+        with patch("gnaroshi_deployment.adapters.ur5e.time.monotonic",lambda:cancel.now):
+            with self.assertRaises(RobotRecoveryRequired) as raised:
+                env.home(cancel)
+        self.assertEqual(raised.exception.category,"home_position_unconfirmed")
+        self.assertAlmostEqual(raised.exception.status["max_joint_error_rad"],.2)
+        self.assertNotIn("last_home_report",env.metadata)
+        self.assertFalse(env.armed.is_set())
+
+    def test_stuck_closed_gripper_blocks_home_motion_and_episode_arming(self):
+        env=self.make(opening=False)
+        env.last_gripper_position=0
+        cancel=self.ClockCancel()
+        with patch("gnaroshi_deployment.adapters.ur5e.time.monotonic",lambda:cancel.now):
+            with self.assertRaises(RobotRecoveryRequired) as raised:
+                env.home(cancel)
+        self.assertEqual(raised.exception.category,"gripper_open_unconfirmed")
+        self.assertEqual(env.control.calls,[])
+        self.assertEqual(env.gripper.commands,[0])
+        with self.assertRaises(RobotRecoveryRequired):env.begin_episode()
+        self.assertFalse(env.armed.is_set())
+
+    def test_begin_episode_rechecks_gripper_even_after_home(self):
+        env=self.make()
+        env._state=lambda:np.r_[np.zeros(6),1.0].astype(np.float32)
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.begin_episode()
+        self.assertEqual(raised.exception.category,"gripper_open_unconfirmed")
+        self.assertEqual(raised.exception.status["measured_position"],255)
+        self.assertFalse(env.armed.is_set())
+
+    def test_begin_episode_rejects_invalid_measured_gripper_position(self):
+        for value in (-1.0,1.01,float("nan"),float("inf")):
+            with self.subTest(position=value):
+                env=self.make()
+                env._state=lambda:np.r_[np.zeros(6),value].astype(np.float32)
+                with self.assertRaises(RobotRecoveryRequired):env.begin_episode()
+                self.assertFalse(env.armed.is_set())
+
+    def test_begin_episode_uses_integer_register_at_open_tolerance_boundary(self):
+        for position in (8,9):
+            with self.subTest(position=position):
+                env=self.make()
+                env._state=lambda:np.r_[np.zeros(6),position/255].astype(np.float32)
+                env._transform=lambda *args:np.eye(4)
+                if position==8:
+                    env.begin_episode()
+                    self.assertTrue(env.armed.is_set())
+                else:
+                    with self.assertRaises(RobotRecoveryRequired) as raised:env.begin_episode()
+                    self.assertEqual(raised.exception.status["measured_position"],9)
+                    self.assertFalse(env.armed.is_set())
+
+    def test_stop_during_final_feedback_does_not_submit_another_home_target(self):
+        env=self.make()
+        cancel=self.ClockCancel()
+        original=env.receive.getActualQ
+        def feedback():
+            if len(env.control.calls)>=2:
+                cancel.cancelled=True
+            return original()
+        env.receive.getActualQ=feedback
+        with patch("gnaroshi_deployment.adapters.ur5e.time.monotonic",lambda:cancel.now):
+            with self.assertRaises(InterruptedError):env.home(cancel)
+        self.assertEqual(len(env.control.calls),2)
+        self.assertNotIn("last_home_report",env.metadata)
+
+    def test_idle_home_preserves_closed_gripper_and_stop_invalidates_target_cache(self):
+        env=self.make()
+        env.last_gripper_position=0
+        env.gripper_status="close"
+        cancel=self.ClockCancel()
+        with patch("gnaroshi_deployment.adapters.ur5e.time.monotonic",lambda:cancel.now):
+            report=env.home_idle(cancel)
+        self.assertFalse(report["gripper_prepared"])
+        self.assertEqual(env.gripper.commands,[])
+        self.assertEqual(env.gripper.position,255)
+        self.assertEqual(env.gripper_status,"close")
+        self.assertTrue(env.stop())
+        self.assertIsNone(env.last_gripper_position)
+
+    def test_stop_during_opening_cancels_without_arm_commands(self):
+        env=self.make(opening=False)
+        cancel=self.ClockCancel()
+        def wait(seconds):
+            cancel.cancelled=True
+            return True
+        cancel.wait=wait
+        with self.assertRaises(InterruptedError):env.home(cancel)
+        self.assertEqual(env.control.calls,[])
+        self.assertFalse(env.armed.is_set())
 
 
 if __name__=="__main__":

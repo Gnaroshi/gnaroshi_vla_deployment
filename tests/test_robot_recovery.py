@@ -183,6 +183,44 @@ class UR5eRecovery(unittest.TestCase):
             release.wait(2)
         return entered,release,wait
 
+    def test_command_latency_separates_driver_wait_without_extra_commands(self):
+        env=self.make()
+        clock=[10.0]
+        def timed(operation,seconds):
+            def run(*args):
+                clock[0]+=seconds
+                return operation(*args)
+            return run
+        env.control.getInverseKinematics=timed(env.control.getInverseKinematics,.002)
+        env.control.servoJ=timed(env.control.servoJ,.0003)
+        env.control.waitPeriod=timed(env.control.waitPeriod,.005)
+        env.gripper.move=timed(env.gripper.move,.001)
+        with patch("gnaroshi_deployment.adapters.ur5e.time.perf_counter",side_effect=lambda:clock[0]):
+            result=env.apply(Prediction(np.array([.001,0,0,0,0,0,.9])))
+        self.assertEqual(env.control.calls,["IK","servoJ"])
+        self.assertEqual(env.gripper.calls,["move"])
+        self.assertEqual(result["command_timing_schema"],"ur5e_driver_wall_v1")
+        self.assertAlmostEqual(result["command_timing_ms"]["inverse_kinematics_ms"],2)
+        self.assertAlmostEqual(result["command_timing_ms"]["servo_total_ms"],5.3)
+        self.assertAlmostEqual(result["command_timing_ms"]["gripper_move_ms"],1)
+        self.assertAlmostEqual(result["servo_timing_ms"]["servo_j_call_ms"],.3)
+        self.assertAlmostEqual(result["servo_timing_ms"]["wait_period_ms"],5)
+        json.dumps(result,allow_nan=False)
+
+    def test_command_latency_is_retained_on_servo_rejection(self):
+        env=self.make()
+        env.control.servo_result=False
+        with self.assertRaises(RobotRecoveryRequired) as raised:
+            env.apply(Prediction(np.array([.001,0,0,0,0,0,.9])))
+        evidence=raised.exception.status
+        self.assertIn("inverse_kinematics_ms",evidence["command_timing_ms"])
+        self.assertIn("servo_total_ms",evidence["command_timing_ms"])
+        self.assertIn("servo_j_call_ms",evidence["servo_timing_ms"])
+        self.assertNotIn("wait_period_ms",evidence["servo_timing_ms"])
+        self.assertEqual(env.control.calls,["IK","servoJ"])
+        self.assertEqual(env.gripper.calls,[])
+        json.dumps(raised.exception.asdict(),allow_nan=False)
+
     def test_safety_faults_block_every_motion_entry_and_disarm(self):
         for method in ("observe","home","begin_episode","apply","_servo"):
             with self.subTest(method=method):
@@ -356,8 +394,15 @@ class UR5eRecovery(unittest.TestCase):
                 env.last_gripper_position=255
                 env.gripper_status="close"
                 before=env.commanded.copy()
+                actual=[0.0]*6
+                def servo(joints,*args):
+                    env.control.calls.append("servoJ")
+                    actual[:]=joints
+                    return True
+                env.control.servoJ=servo
+                env.receive.getActualQ=lambda:list(actual)
                 (env.home_idle if idle else env.home)(Running())
-                self.assertEqual(env.control.calls,["servoJ"])
+                self.assertEqual(env.control.calls,["servoJ"]*3)
                 self.assertEqual(env.gripper.calls,[] if idle else ["activate","move"])
                 self.assertEqual(env.last_gripper_position,255 if idle else 0)
                 self.assertEqual(env.gripper_status,"close" if idle else "open")

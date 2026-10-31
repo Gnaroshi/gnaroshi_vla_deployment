@@ -86,7 +86,7 @@ PYTHONPATH=src python -m gnaroshi_deployment.cli \
 | Save `[W]` | 결과와 notes 저장; notes 편집도 자동 저장 |
 | Devices | 카메라 검색·역할 변경·swap·카메라만 재연결 |
 | Config | READY에서 실행 속도·명령 수·녹화 변경, 다음 Load에 적용할 정책 설정 편집 |
-| Settings | 글자 크기·참고 장면 표시·pane 배치 등 GUI 설정 |
+| Settings | 글자 크기·참고 장면 표시·pane 배치·rollout 연속 번호 설정 |
 | Help `[F1]` | 단축키·운용 안내 |
 | Delete last `[D]` | 확인 후 마지막 저장 결과/영상 삭제 |
 | Exit `[Esc]` | pending action 취소 → 미분류 attempt 폐기 → 장치 종료 |
@@ -96,6 +96,17 @@ target Hz와 max steps는 READY에서 수정할 수 있다. 지연된 추론 결
 성공/실패 뒤 home의 완료·취소·오류도 기록한다. 실행 중 보호정지·연결 끊김·IK 실패·정책 오류는
 **자동 Failure**로 저장하고 성공률에 반영한다. 수동 Failure와는 원인·`outcome_source`로 구분한다.
 대기 중 발생한 오류는 note와 event를 남기며 새 rollout을 만들지 않는다.
+
+UR5e의 Start와 outcome 복귀는 그리퍼 열림을 실측한 뒤 팔을 이동하고, 모든 관절이 home
+허용 오차 안에 연속으로 들어왔는지 확인한다. 명령 수락만으로 복귀 완료를 기록하지 않는다.
+열림·관절 도달 확인에는 제한 시간이 있으며, 실패하면 원인을 기록하고 다음 Start를 막는다.
+이미 저장한 Success/Failure는 복귀 오류로 바꾸지 않는다. Stop/Retry는 계속 현 위치에서
+멈추고 attempt를 폐기하며, 자동으로 home을 실행하지 않는다.
+
+Rollout 번호는 기본적으로 **저장한 결과에 연속으로 부여**한다. Stop/Retry로 폐기한 시도는
+번호를 소비하지 않는다. Settings에서 연속 번호를 끄면 폐기한 시도까지 세는 attempt 번호를
+사용한다. 설정은 다음 실행에도 유지되며, 진행 중에는 바꿀 수 없다. 기존 저장 결과의 번호와
+폴더는 변경하지 않는다. 각 결과의 `attempt_id`와 event 기록으로 실제 시도 순서도 추적한다.
 
 Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5e는 팔의 자세만 이동하고 그리퍼를
 열거나 activation하지 않는다. Stop/Exit로 취소할 수 있다. 다른 embodiment는 optional
@@ -113,7 +124,7 @@ Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5
 ### 집계·글자·작업 영역
 
 로봇을 반복 평가하는 operator가 현재 상태와 다음 조작, 저장된 결과를 바로 읽도록 구성한다.
-상단의 **Success / Failure / Success rate / Total**은 현재 session에서 저장·확정한 rollout만
+상단의 **Success / Failure / Success rate / Saved**는 현재 session에서 저장·확정한 rollout만
 집계한다. 자동 fault도 Failure 합계에 포함하고, Failure 바로 아래에 그중 자동 실패 수를 표시한다.
 Stop/Retry로 폐기한 attempt와 idle 오류는 제외한다.
 Success 이후 복귀 Home 오류는 이미 확정된 outcome을 바꾸지 않는다. 0개일 때 성공률은
@@ -143,9 +154,15 @@ Policy 설정은 오른쪽 inspector에서 편집하므로 폼이나 로드 오�
 선택값을 바꾸지 않는다. Details 갱신은 읽던 위치·커서·선택을 유지하며, 선택한 텍스트는
 선택을 해제할 때까지 보존한다.
 
-하단 상태 바는 준비·로딩·실행·정지·복구 단계와 다음 행동을 보여준다. 실행 중 진행 막대는
+최상단 상태 바는 준비·로딩·실행·정지·복구 단계와 다음 행동을 보여준다. 실행 중 진행 막대는
 명령 수와 설정된 한도를 나타낸다. 한도 도달 뒤에는 수동 outcome을 기다리며 성공으로 판정하지 않는다.
 로딩·Home·정지·복구처럼 전체 작업량이 정해지지 않은 단계에는 실제 단계명과 대기 표시를 사용한다.
+
+Rollouts는 목록과 선택 결과/annotation을 나눈 크기 조절 패널이다. 가운데 경계를 끌거나
+키보드로 조절할 수 있고 배치를 저장한다. 새 결과가 추가되면 마지막 행을 보여주며, 일반
+상태 갱신은 읽던 위치와 선택을 바꾸지 않는다. 선택한 결과의 폴더·경로 복사·영상 열기는
+같은 도구 영역에 두고, 마지막 결과 삭제는 대상 확인을 거치는 별도 파괴적 조작으로 구분한다.
+Annotation은 여러 줄로 편집하며 자동 저장한다. Exit도 실행·판정 버튼과 구분해 표시한다.
 
 글자·창·pane 배치는 local UI preferences에 보관한다. 글자 크기는 선택 즉시 저장하므로
 checkpoint 교체나 다음 실행에서도 마지막 값을 복원한다. 저장하지 못하면 Settings에 오류를

@@ -13,6 +13,15 @@ import numpy as np
 from ..contracts import CameraError, Observation, RobotActionError, RobotRecoveryRequired, action_vector
 
 
+def _timed_call(timings, name, operation, *args):
+    """Measure an existing driver call without adding reads, retries or motion."""
+    started=time.perf_counter()
+    try:
+        return operation(*args)
+    finally:
+        timings[name]=1000*(time.perf_counter()-started)
+
+
 @dataclass
 class UR5eConfig:
     robot_ip: str = ""
@@ -27,11 +36,15 @@ class UR5eConfig:
     home_joints: tuple = ()
     home_duration_s: float = 3.0
     home_hz: int = 10
+    home_joint_tolerance_rad: float = 0.01
+    home_settle_timeout_s: float = 3.0
     close_threshold: float = 0.25
     release_threshold: float = 0.10
     gripper_speed: int = 255
     gripper_force: int = 10
     gripper_period_s: float = 0.5
+    gripper_open_tolerance: int = 8
+    gripper_open_timeout_s: float = 3.0
     initial_open_steps: int = 5
     servo_time_s: float = 1/500
     servo_lookahead_s: float = 0.2
@@ -59,6 +72,13 @@ class UR5eConfig:
             raise ValueError("Invalid gripper hysteresis thresholds")
         if len(self.home_joints)!=6 or not np.isfinite(self.home_joints).all():
             raise ValueError("Task home must contain six finite joint angles")
+        if (type(self.home_hz) is not int or not 1<=self.home_hz<=500
+                or any(not np.isfinite(value) or value<=0 for value in
+                       (self.home_duration_s,self.home_joint_tolerance_rad,
+                        self.home_settle_timeout_s,self.gripper_open_timeout_s))):
+            raise ValueError("Home timing/tolerance and gripper verification deadline must be finite and positive")
+        if type(self.gripper_open_tolerance) is not int or not 0<=self.gripper_open_tolerance<=25:
+            raise ValueError("Gripper open tolerance must be an integer register position in [0,25]")
         if not 0<self.recovery_freshness_timeout_s<=self.recovery_timeout_s or not np.isfinite(self.recovery_timeout_s):
             raise ValueError("Recovery deadlines must be finite and positive")
 
@@ -139,6 +159,10 @@ class UR5eEmbodiment:
                        "release_threshold":config.release_threshold,"camera_fps":config.camera_fps,
                        "initial_open_steps":config.initial_open_steps,"gripper_period_s":config.gripper_period_s}
         self.metadata["gripper_activation"]="operator Start only; inactive activation may trigger firmware calibration"
+        self.metadata["home_verification"]={"joint_tolerance_rad":config.home_joint_tolerance_rad,
+            "settle_timeout_s":config.home_settle_timeout_s,"servo_period_s":1/config.home_hz,
+            "gripper_open_tolerance":config.gripper_open_tolerance,
+            "gripper_open_timeout_s":config.gripper_open_timeout_s}
         self.armed=threading.Event()
         self.command_lock=threading.Lock()
         self.control=self.receive=self.gripper=None
@@ -796,20 +820,32 @@ class UR5eEmbodiment:
         self._assert_robot_ready("observation feedback")
         return Observation(images,state,time.time_ns(),metadata,time.monotonic_ns())
 
-    def _servo(self,joints):
+    def _servo(self,joints,*,duration_s=None,cancel=None):
         cfg=self.config
+        duration=cfg.servo_time_s if duration_s is None else duration_s
+        timings={}
         details={"target_joints":list(joints),"arm_command_attempted":False,"arm_command_sent":False,
-                 "arm_command_acknowledged":False}
+                 "arm_command_acknowledged":False,"servo_timing_ms":timings}
         try:
-            before=self._assert_robot_ready("servo command")
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("Home cancelled")
+            before=_timed_call(timings,"status_before_ms",self._assert_robot_ready,"servo command")
             details["status_before"]=before
-            token=self.control.initPeriod()
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("Home cancelled")
+            token=_timed_call(timings,"init_period_ms",self.control.initPeriod)
+            if cancel is not None and cancel.is_set():
+                raise InterruptedError("Home cancelled")
             details.update(arm_command_attempted=True,arm_command_sent=None)
-            if not self.control.servoJ(list(joints),cfg.velocity,cfg.acceleration,cfg.servo_time_s,cfg.servo_lookahead_s,cfg.servo_gain):
+            if not _timed_call(timings,"servo_j_call_ms",self.control.servoJ,list(joints),cfg.velocity,
+                               cfg.acceleration,duration,cfg.servo_lookahead_s,cfg.servo_gain):
                 raise self._driver_failure("UR5e servoJ rejected command",details,category="servo_rejected")
             details.update(arm_command_sent=True,arm_command_acknowledged=True)
-            self.control.waitPeriod(token)
-            self._assert_robot_ready("servo feedback")
+            _timed_call(timings,"wait_period_ms",self.control.waitPeriod,token)
+            _timed_call(timings,"status_after_ms",self._assert_robot_ready,"servo feedback")
+            return timings
+        except InterruptedError:
+            raise
         except RobotRecoveryRequired as error:
             raise self._failure_context(error,details)
         except Exception as error:
@@ -825,14 +861,44 @@ class UR5eEmbodiment:
 
     def _home(self,cancel,*,prepare_gripper):
         cfg=self.config
+        self.armed.clear()
+        self.metadata.pop("last_home_report",None)
         if cancel.is_set():
             raise InterruptedError("Home cancelled")
         self._assert_robot_ready("home")
+        gripper_position=None
         if prepare_gripper:
             # Idle Home must never open a held object or activate the fingers.
             try:
                 self.gripper.activate(cancel,self.command_lock)
+                with self.command_lock:
+                    if cancel.is_set():
+                        raise InterruptedError("Gripper preparation cancelled")
+                    # A previous SET target is not measured position. In particular
+                    # stop() halts GTO while an opening command may still be in flight.
+                    self.gripper.move(0,cfg.gripper_speed,cfg.gripper_force)
+                    self.last_gripper_position=0
+                    self.last_gripper_time=time.monotonic()
+                deadline=time.monotonic()+cfg.gripper_open_timeout_s
+                while True:
+                    if cancel.is_set():
+                        raise InterruptedError("Gripper preparation cancelled")
+                    gripper_position=self.gripper.get("POS")
+                    if not 0<=gripper_position<=255:
+                        raise ValueError(f"Invalid measured gripper position: {gripper_position}")
+                    if gripper_position<=cfg.gripper_open_tolerance:
+                        self.gripper_status="open"
+                        break
+                    if time.monotonic()>=deadline:
+                        raise self._fault_error("Gripper opening was not confirmed before home",
+                            {"requested_position":0,"measured_position":gripper_position,
+                             "open_tolerance":cfg.gripper_open_tolerance,"timeout_s":cfg.gripper_open_timeout_s},
+                            category="gripper_open_unconfirmed")
+                    if cancel.wait(.02):
+                        raise InterruptedError("Gripper preparation cancelled")
             except InterruptedError:
+                raise
+            except RobotRecoveryRequired:
                 raise
             except Exception as error:
                 raise self._driver_failure("Gripper preparation failed before home",{},
@@ -845,38 +911,86 @@ class UR5eEmbodiment:
             raise self._driver_failure("Joint feedback failed before home",{},
                                        category="state_feedback_error",error=error) from error
         steps=max(1,round(cfg.home_duration_s*cfg.home_hz))
+        period=1/cfg.home_hz
+        target=np.asarray(cfg.home_joints,dtype=np.float64)
         for index in range(steps):
             started=time.monotonic()
             with self.command_lock:
                 if cancel.is_set():
                     raise InterruptedError("Home cancelled")
-                joints=initial+(np.asarray(cfg.home_joints)-initial)*(index+1)/steps
-                self._servo(joints)
-                if prepare_gripper:
-                    try:
-                        if self.last_gripper_position!=0:
-                            self.gripper.move(0,cfg.gripper_speed,cfg.gripper_force)
-                            self.last_gripper_position=0
-                            self.last_gripper_time=time.monotonic()
-                        self.gripper_status="open"
-                    except Exception as error:
-                        raise self._driver_failure("Gripper open command failed during home",{},
-                                                   category="gripper_command_failed",error=error) from error
-            if cancel.wait(max(0,1/cfg.home_hz-(time.monotonic()-started))):
+                joints=initial+(target-initial)*(index+1)/steps
+                # The home loop supplies setpoints at home_hz, so the command
+                # duration must span that period rather than the rollout's 2ms.
+                self._servo(joints,duration_s=period,cancel=cancel)
+            if cancel.wait(max(0,period-(time.monotonic()-started))):
                 raise InterruptedError("Home cancelled")
-        if cancel.wait(0.5):
-            raise InterruptedError("Home cancelled")
+        deadline=time.monotonic()+cfg.home_settle_timeout_s
+        stable=0
+        while True:
+            started=time.monotonic()
+            with self.command_lock:
+                if cancel.is_set():
+                    raise InterruptedError("Home cancelled")
+                self._assert_robot_ready("home position verification")
+                try:
+                    actual=np.asarray(self.receive.getActualQ(),dtype=np.float64)
+                    if actual.shape!=(6,) or not np.isfinite(actual).all():
+                        raise ValueError("Home requires six finite measured joint positions")
+                except Exception as error:
+                    raise self._driver_failure("Joint feedback failed after home",{},
+                                               category="state_feedback_error",error=error) from error
+                error=float(np.max(np.abs(actual-target)))
+                stable=stable+1 if error<=cfg.home_joint_tolerance_rad else 0
+                if stable>=3:
+                    if prepare_gripper:
+                        try:
+                            gripper_position=self.gripper.get("POS")
+                        except Exception as error:
+                            raise self._driver_failure("Gripper feedback failed after home",{},
+                                                       category="gripper_command_failed",error=error) from error
+                        if not 0<=gripper_position<=cfg.gripper_open_tolerance:
+                            raise self._fault_error("Open gripper position was lost during home",
+                                {"measured_position":gripper_position,"open_tolerance":cfg.gripper_open_tolerance},
+                                category="gripper_open_unconfirmed")
+                    if cancel.is_set():
+                        raise InterruptedError("Home cancelled")
+                    report={"verified":True,"target_joints":target.tolist(),"actual_joints":actual.tolist(),
+                            "max_joint_error_rad":error,"joint_tolerance_rad":cfg.home_joint_tolerance_rad,
+                            "consecutive_position_checks":stable,"servo_period_s":period,
+                            "gripper_prepared":prepare_gripper,"gripper_position":gripper_position}
+                    self.metadata["last_home_report"]=report
+                    return report
+                if time.monotonic()>=deadline:
+                    raise self._fault_error("Home joint target was not reached before the verification deadline",
+                        {"target_joints":target.tolist(),"actual_joints":actual.tolist(),
+                         "max_joint_error_rad":error,"joint_tolerance_rad":cfg.home_joint_tolerance_rad,
+                         "timeout_s":cfg.home_settle_timeout_s},category="home_position_unconfirmed")
+                self._servo(target,duration_s=period,cancel=cancel)
+            if cancel.wait(max(0,period-(time.monotonic()-started))):
+                raise InterruptedError("Home cancelled")
 
     def begin_episode(self):
         self._assert_robot_ready("episode reset")
         state=self._state()
         with self.command_lock:
             self._assert_robot_ready("episode arming")
+            position=float(state[6])*255
+            valid_position=np.isfinite(position) and 0<=position<=255
+            if valid_position:
+                # _state stores POS/255 as float32; recover the integer register
+                # before comparing a boundary such as POS8 (8.00000047 here).
+                position=round(position)
+            if not valid_position or position>self.config.gripper_open_tolerance:
+                raise self._fault_error("A fresh rollout requires a confirmed open gripper",
+                    {"measured_position":position,"open_tolerance":self.config.gripper_open_tolerance},
+                    category="gripper_open_unconfirmed")
             self.commanded=self._transform(state[:3],state[3:6])
             self.steps=0
             self.armed.set()
 
     def apply(self,prediction):
+        timings={}
+        started=time.perf_counter()
         try:
             raw=action_vector(prediction.action)
         except (TypeError,ValueError,OverflowError) as error:
@@ -898,18 +1012,22 @@ class UR5eEmbodiment:
                  "action_rotation_norm_rad":rotation if np.isfinite(rotation) else repr(rotation),
                  "arm_command_attempted":False,"arm_command_sent":False,"arm_command_acknowledged":False,
                  "gripper_command_attempted":False,"gripper_command_sent":False,
-                 "gripper_command_acknowledged":False}
+                 "gripper_command_acknowledged":False,"command_timing_ms":timings}
+        timings["action_validation_ms"]=1000*(time.perf_counter()-started)
         if self.recovery_required:
             try:
                 self._assert_robot_ready("policy command")
             except RobotRecoveryRequired as error:
                 raise self._failure_context(error,details)
+        lock_started=time.perf_counter()
         with self.command_lock:
+            timings["command_lock_wait_ms"]=1000*(time.perf_counter()-lock_started)
             if not self.armed.is_set():
                 raise InterruptedError("Policy command cancelled")
             try:
-                self._assert_robot_ready("policy command")
+                _timed_call(timings,"status_check_ms",self._assert_robot_ready,"policy command")
                 details["previous_commanded_transform"]=self.commanded.tolist()
+                transform_started=time.perf_counter()
                 try:
                     with np.errstate(over="ignore",invalid="ignore"):
                         target=self.commanded @ self._transform(action[:3],action[3:6])
@@ -919,9 +1037,11 @@ class UR5eEmbodiment:
                 except (TypeError,ValueError,OverflowError) as error:
                     self.armed.clear()
                     raise RobotActionError(str(error),status=details,category="invalid_action_target") from error
+                finally:
+                    timings["target_transform_ms"]=1000*(time.perf_counter()-transform_started)
                 details["target_tcp_rotvec"]=tcp.tolist()
                 try:
-                    current=np.asarray(self.receive.getActualQ(),dtype=np.float64)
+                    current=np.asarray(_timed_call(timings,"joint_feedback_ms",self.receive.getActualQ),dtype=np.float64)
                     if current.shape!=(6,) or not np.isfinite(current).all():
                         raise ValueError("IK requires six finite measured joint positions")
                 except Exception as error:
@@ -929,7 +1049,7 @@ class UR5eEmbodiment:
                                                category="state_feedback_error",error=error) from error
                 details["measured_joints"]=current.tolist()
                 try:
-                    joints=self.control.getInverseKinematics(tcp.tolist(),current.tolist())
+                    joints=_timed_call(timings,"inverse_kinematics_ms",self.control.getInverseKinematics,tcp.tolist(),current.tolist())
                 except Exception as error:
                     raise self._driver_failure("Inverse kinematics request failed",details,
                                                category="ik_request_failed",error=error) from error
@@ -946,7 +1066,9 @@ class UR5eEmbodiment:
                 # Stop latches without waiting for this lock, so recheck after IK.
                 if not self.armed.is_set():
                     raise InterruptedError("Policy command cancelled during IK")
-                self._servo(joints)
+                servo_timings=_timed_call(timings,"servo_total_ms",self._servo,joints)
+                if isinstance(servo_timings,dict):
+                    details["servo_timing_ms"]=servo_timings
                 details.update(arm_command_attempted=True,arm_command_sent=True,arm_command_acknowledged=True)
                 self.commanded=target
                 self.steps+=1
@@ -967,7 +1089,7 @@ class UR5eEmbodiment:
                         details.update(gripper_command_attempted=True,gripper_command_sent=None,
                                        gripper_command_acknowledged=False)
                         try:
-                            self.gripper.move(position,cfg.gripper_speed,cfg.gripper_force)
+                            _timed_call(timings,"gripper_move_ms",self.gripper.move,position,cfg.gripper_speed,cfg.gripper_force)
                         except Exception as error:
                             raise self._driver_failure("Gripper move command failed",details,
                                                        category="gripper_command_failed",error=error) from error
@@ -980,7 +1102,9 @@ class UR5eEmbodiment:
                         "target_joints":list(joints),"gripper_desired":desired,"gripper_command":self.last_gripper_position,
                         "gripper_command_attempted":details["gripper_command_attempted"],
                         "gripper_command_sent":sent,"gripper_command_acknowledged":details["gripper_command_acknowledged"],
-                        "gripper_state":self.gripper_status}
+                        "gripper_state":self.gripper_status,"command_timing_ms":timings,
+                        "servo_timing_ms":details.get("servo_timing_ms",{}),
+                        "command_timing_schema":"ur5e_driver_wall_v1"}
             except RobotRecoveryRequired as error:
                 raise self._failure_context(error,details)
 
@@ -1002,6 +1126,8 @@ class UR5eEmbodiment:
             if self.gripper is not None:
                 try:
                     self.gripper.halt()
+                    self.last_gripper_position=None
+                    self.last_gripper_time=0.0
                 except Exception as exc:
                     error=error or self._driver_failure("Gripper halt command failed",{},
                                                        category="gripper_command_failed",error=exc)

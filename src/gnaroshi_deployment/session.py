@@ -57,6 +57,11 @@ class DeploymentSession:
         self._notes = ""
         self._automatic_notes = []
         self._sequence = 0
+        self._attempt_sequence = 0
+        self._continuous_rollout_indices = config.metadata.get("continuous_rollout_indices", True)
+        if type(self._continuous_rollout_indices) is not bool:
+            raise ValueError("continuous_rollout_indices must be a boolean")
+        self.config.metadata["continuous_rollout_indices"] = self._continuous_rollout_indices
         self._camera_error = None
         self._camera_return_state = None
         self._camera_stats = {}
@@ -696,6 +701,35 @@ class DeploymentSession:
             self.manifest["config"] = self.config.asdict()
             write_json(self.folder / "manifest.json", self.manifest)
 
+    @property
+    def continuous_rollout_indices(self):
+        """Saved result numbers remain consecutive when attempts are discarded."""
+        with self.lock:
+            return self._continuous_rollout_indices
+
+    def set_continuous_rollout_indices(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError("Rollout numbering must be enabled or disabled explicitly")
+        with self.lock:
+            if self._started and (self.state not in {"SELECTING", "READY"}
+                                  or self._rollout_active or self._home_active or self.closing.is_set()):
+                return False
+            self._continuous_rollout_indices = enabled
+            self.config.metadata["continuous_rollout_indices"] = enabled
+            self.manifest["config"] = self.config.asdict()
+            write_json(self.folder / "manifest.json", self.manifest)
+            self._journal("rollout_numbering_changed", continuous_rollout_indices=enabled)
+        return True
+
+    def _reserve_rollout_number(self):
+        with self.lock:
+            self._attempt_sequence += 1
+            self._sequence = (max((int(row["id"]) for row in self.results), default=0) + 1
+                              if self._continuous_rollout_indices else self._attempt_sequence)
+            self._journal("rollout_reserved", rollout_id=self._sequence, attempt_id=self._attempt_sequence,
+                          continuous_rollout_indices=self._continuous_rollout_indices)
+            return self._sequence
+
     def apply_recording(self, enabled):
         if type(enabled) is not bool:
             raise ValueError("recording must be enabled or disabled explicitly")
@@ -1038,6 +1072,7 @@ class DeploymentSession:
         recording_errors = []
         phase, step = "start", None
         observation = prediction = None
+        start_home_report = None
         self.rows = []
         # Preserve a stop issued after Start but before worker dispatch.
         with self.lock:
@@ -1058,7 +1093,7 @@ class DeploymentSession:
         camera_serials = dict(self._device_status["selected"])
         try:
             self._state("HOMING")
-            self._sequence += 1
+            self._reserve_rollout_number()
             episode = f"rollout_{self._sequence:04d}_{uuid.uuid4().hex[:6]}"
             folder = self.folder / episode
             phase = "record_open"
@@ -1067,9 +1102,11 @@ class DeploymentSession:
             phase = "policy_ready"
             self._check_policy_ready()
             phase = "home"
-            self.embodiment.home(self.cancel)
+            start_home_report = self.embodiment.home(self.cancel)
             if self.cancel.is_set():
                 raise InterruptedError("home cancelled")
+            self._journal("start_home_completed", rollout_id=self._sequence,
+                          attempt_id=self._attempt_sequence, report=self._json_safe(start_home_report))
             phase = "reset"
             self._policy_operation(self.policy.reset, episode)
             if self.cancel.is_set():
@@ -1138,7 +1175,7 @@ class DeploymentSession:
             recoverable_error = error
             failure = self._failure_details(error, phase, step)
             if folder is None:
-                self._sequence += 1
+                self._reserve_rollout_number()
                 folder = self.folder / f"rollout_{self._sequence:04d}_{uuid.uuid4().hex[:6]}"
                 recorder = RolloutRecorder(folder, self.config.target_hz, self.config.record_video)
             self._require_recovery(error)
@@ -1234,7 +1271,10 @@ class DeploymentSession:
                 self._note_failure(failure, self._sequence)
             outcome = accepted_stop_outcome or ("failure" if failure is not None else self.request)
             if folder and outcome in {"success", "failure"}:
-                result = {"id": self._sequence, "outcome": outcome, "directory": folder.name,
+                result = {"id": self._sequence, "attempt_id": self._attempt_sequence,
+                          "continuous_rollout_indices": self._continuous_rollout_indices,
+                          "start_home_report": self._json_safe(start_home_report),
+                          "outcome": outcome, "directory": folder.name,
                           "target_hz": self.config.target_hz, "max_steps": self.config.max_steps,
                           "outcome_source": "automatic_fault" if failure is not None and not accepted_stop_outcome else "manual",
                           "outcome_home": ("blocked_recovery" if recoverable_error is not None and accepted_stop_outcome else
@@ -1257,7 +1297,8 @@ class DeploymentSession:
                 self.save()
             elif folder:
                 shutil.rmtree(folder)
-                self._journal("discard_rollout", directory=folder.name, reason=outcome)
+                self._journal("discard_rollout", directory=folder.name, reason=outcome,
+                              rollout_id=self._sequence, attempt_id=self._attempt_sequence)
             if self.closing.is_set():
                 return
             if recoverable_error is not None:
@@ -1275,11 +1316,27 @@ class DeploymentSession:
                 with self.lock:
                     if self.request in {"success", "failure"}:
                         self.cancel.clear()
+                        self._stop_confirmed = False
                         self._state("HOMING", "Outcome saved; returning home")
                 if not self.cancel.is_set():
                     try:
-                        self.embodiment.home(self.cancel)
+                        report = self.embodiment.home(self.cancel)
+                        if self.cancel.is_set():
+                            raise InterruptedError("Outcome home cancelled")
+                        result["outcome_home_report"] = self._json_safe(report)
+                        self._stop_confirmed = bool(self.embodiment.stop())
+                        if not self._stop_confirmed:
+                            self._stop_failed = True
+                            fault = getattr(self.embodiment, "recovery_error", None)
+                            if isinstance(fault, RobotRecoveryRequired):
+                                raise fault
+                            raise RuntimeError("Robot did not acknowledge stop after outcome home")
+                        if self.cancel.is_set():
+                            raise InterruptedError("Outcome home cancelled")
                         result["outcome_home"] = "completed"
+                        result["outcome_home_stop_confirmed"] = True
+                        self._journal("outcome_home_completed", rollout_id=self._sequence,
+                                      report=result["outcome_home_report"], stop_confirmed=True)
                     except InterruptedError:
                         result["outcome_home"] = "cancelled"
                     except RobotRecoveryRequired as error:
