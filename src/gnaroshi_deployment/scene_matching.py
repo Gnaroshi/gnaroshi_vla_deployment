@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -81,12 +82,21 @@ def index_rollouts(root, *, cancel=None, limit=2000, max_directories=20000, time
             break
         names[:] = sorted(name for name in names if not name.startswith(".")
                           and not (Path(directory) / name).is_symlink())
-        if "result.json" not in files:
+        filename = "setup_reference.json" if "setup_reference.json" in files else "result.json"
+        if filename not in files:
             continue
         try:
             folder = _contained(root, directory)
-            result_path = _contained(root, folder / "result.json")
+            result_path = _contained(root, folder / filename)
             result = _json(result_path)
+            if filename == "setup_reference.json":
+                if result.get("kind") != "setup_capture" or result.get("schema_version") != 1:
+                    raise ValueError("Unsupported setup reference")
+                relative = result_path.relative_to(root).as_posix()
+                records.append({**result["reference"], "record_id": _digest(relative.encode()),
+                                "result_relative_path": relative, "result_sha256": _digest(result_path.read_bytes()),
+                                "source_kind": "setup_capture", "created_ns": result["captured_ns"]})
+                continue
             manifest = {}
             ancestor = folder.parent
             while ancestor.is_relative_to(root):
@@ -128,6 +138,51 @@ def index_rollouts(root, *, cancel=None, limit=2000, max_directories=20000, time
     return records, warnings[:20]
 
 
+def save_setup_reference(root, observation, *, task, instruction, state_description, camera_serials,
+                         home_joints=None, previous_trial_context=None):
+    """Persist an explicit idle observation, never a synthetic rollout outcome."""
+    root = Path(root).resolve()
+    state = np.asarray(observation.state, dtype=float)
+    if state.ndim != 1 or not state.size or not np.isfinite(state).all():
+        raise ValueError("Setup capture requires complete measured robot state")
+    if not isinstance(observation.captured_ns, int) or not 0 <= time.time_ns()-observation.captured_ns <= 3_000_000_000:
+        raise ValueError("Setup capture requires fresh camera observations")
+    if getattr(observation, "preview_only", False) or observation.camera_metadata.get("preview_only"):
+        raise ValueError("Camera-only preview cannot define a robot starting state")
+    if not observation.images or len(observation.images) > 8:
+        raise ValueError("Setup capture requires one to eight camera views")
+    for role, image in observation.images.items():
+        if not role.replace("_", "").replace("-", "").isalnum():
+            raise ValueError("Invalid setup camera role")
+        if image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3 or max(image.shape[:2]) > 4096:
+            raise ValueError("Setup images must be supported RGB uint8 frames")
+    folder = root / "_layouts" / "captures" / (time.strftime("%Y%m%dT%H%M%S") + "_" + uuid.uuid4().hex[:12])
+    folder.mkdir(parents=True)
+    images = {}
+    for role, image in observation.images.items():
+        path = folder / f"initial_{role}.png"
+        Image.fromarray(image).save(path, format="PNG", compress_level=1)
+        images[role] = {"path": path.name, "sha256": _digest(path.read_bytes()),
+                        "width": int(image.shape[1]), "height": int(image.shape[0])}
+    snapshot = {"schema_version": 1, "stage": "operator_setup_capture", "state": state.tolist(),
+                "captured_ns": observation.captured_ns,
+                "captured_monotonic_ns": getattr(observation, "captured_monotonic_ns", None),
+                "camera_metadata": copy.deepcopy(observation.camera_metadata), "camera_serials": dict(camera_serials),
+                "images": images, "identity": {"task": task, "instruction": instruction, "state_layout": state_description},
+                "previous_trial_context": copy.deepcopy(previous_trial_context or {})}
+    write_json(folder / "initial_state.json", snapshot)
+    record_path = folder / "setup_reference.json"
+    relative = record_path.relative_to(root).as_posix()
+    reference = {"task": task, "instruction": instruction, "method": "Setup capture", "checkpoint": "No policy executed",
+                 "rollout_id": "—", "outcome": "Reference only", "camera_serials": dict(camera_serials),
+                 "state_description": state_description, "home_joints": home_joints, "source_kind": "setup_capture"}
+    write_json(record_path, {"schema_version": 1, "kind": "setup_capture", "captured_ns": observation.captured_ns,
+                             "reference": reference})
+    record = {**reference, "record_id": _digest(relative.encode()), "result_relative_path": relative,
+              "result_sha256": _digest(record_path.read_bytes()), "created_ns": observation.captured_ns}
+    return load_reference(root, record)
+
+
 def load_reference(root, record):
     """Read lossless snapshots; older recordings explicitly use a decoded frame."""
     root = Path(root).resolve()
@@ -135,12 +190,14 @@ def load_reference(root, record):
     folder = result_path.parent
     if _digest(record["result_relative_path"].encode()) != record["record_id"]:
         raise ValueError("The reference identifier does not match its result path")
-    _json(result_path)
+    record_document = _json(result_path)
+    setup_capture = record_document.get("kind") == "setup_capture"
     snapshot = folder / "initial_state.json"
     images, hashes, state, serials = {}, {}, [], dict(record.get("camera_serials", {}))
     if snapshot.is_file():
         data = _json(_contained(root, snapshot))
-        if data.get("stage") != "after_home_before_first_action":
+        expected_stage = "operator_setup_capture" if setup_capture else "after_home_before_first_action"
+        if data.get("stage") != expected_stage:
             raise ValueError("Snapshot is not marked as the first policy observation")
         state = data.get("state", [])
         serials.update(_serials(data.get("camera_metadata", {})))
@@ -162,7 +219,7 @@ def load_reference(root, record):
                 source.load()
                 images[role] = np.asarray(source.convert("RGB")).copy()
             hashes[role] = _digest(images[role].tobytes())
-        source_kind = "lossless_first_observation"
+        source_kind = "setup_capture" if setup_capture else "lossless_first_observation"
     else:
         executable = shutil.which("ffmpeg")
         if executable is None:
@@ -287,6 +344,95 @@ def match_objects(reference, live, objects, *, tolerance_px=8.0, min_score=.65):
     return rows
 
 
+def _orientation_matrix(euler):
+    """Extrinsic Euler xyz: Rz @ Ry @ Rx, matching the declared TCP contract."""
+    x, y, z = map(float, euler)
+    cx, cy, cz, sx, sy, sz = math.cos(x), math.cos(y), math.cos(z), math.sin(x), math.sin(y), math.sin(z)
+    return np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]]) @ np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]]) @ np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]])
+
+
+def robot_difference(reference, state, tolerances):
+    target, actual = np.asarray(reference.get("initial_state", []), dtype=float), np.asarray(state, dtype=float)
+    description = reference.get("state_description", "")
+    if target.shape != actual.shape or not target.size or not np.isfinite(target).all() or not np.isfinite(actual).all():
+        return {"verified":False, "status":"state_unavailable", "state_layout":description}
+    if target.shape != (7,) or not description.startswith("TCP xyz meters + Euler xyz radians"):
+        return {"verified":False, "status":"physical_units_not_declared", "state_layout":description,
+                "max_absolute_delta":float(np.abs(actual-target).max())}
+    distance = float(np.linalg.norm(actual[:3]-target[:3]))*1000
+    relative = _orientation_matrix(target[3:6]).T @ _orientation_matrix(actual[3:6])
+    degrees = math.degrees(math.acos(float(np.clip((np.trace(relative)-1)/2, -1, 1))))
+    gripper = float(abs(actual[6]-target[6]))
+    passed = distance <= tolerances["translation_mm"] and degrees <= tolerances["rotation_deg"] and gripper <= tolerances["gripper_ratio"]
+    return {"verified":True, "passed":passed, "status":"within_tolerance" if passed else "robot_state_mismatch",
+            "translation_mm":distance, "rotation_deg":degrees, "gripper_ratio_delta":gripper,
+            "tolerances":copy.deepcopy(tolerances), "state_layout":description}
+
+
+def build_initial_checker(context, reference_images):
+    """Freeze a data-only post-Home checker; its callback never accesses Tk/hardware."""
+    context = copy.deepcopy(context)
+    reference = context["reference"]
+    images = {role:image.copy() for role,image in reference_images.items()}
+    objects = validate_objects(context.get("objects", []), images)
+    alignment = context["alignment"]
+    tolerances = context.get("robot_tolerances", {"translation_mm":5.0,"rotation_deg":3.0,"gripper_ratio":.05})
+    basis = alignment.get("confirmation_basis")
+    reason = alignment.get("confirmation_reason", "")
+    if basis not in {"matched_regions", "visual_override", "visual_only"} or not alignment.get("operator_confirmed"):
+        raise ValueError("Confirm this starting scene before Start")
+    if basis == "visual_override" and not str(reason).strip():
+        raise ValueError("A visual override needs its reason")
+    if basis == "visual_only" and objects:
+        raise ValueError("Visual-only approval cannot hide specified object checks")
+    if basis == "matched_regions" and not objects:
+        raise ValueError("Matched-region approval needs at least one object region")
+    tolerance, score = float(alignment["pixel_tolerance"]), float(alignment["similarity_threshold"])
+    if not math.isfinite(tolerance) or tolerance <= 0 or not 0 < score <= 1:
+        raise ValueError("Invalid matching parameters")
+    if any(not math.isfinite(float(value)) or float(value) <= 0 for value in tolerances.values()):
+        raise ValueError("Robot tolerances must be finite and positive")
+    def check(observation):
+        captured = getattr(observation, "captured_ns", None)
+        report = {"schema_version":1,"passed":False,"status":"checking","captured_ns":captured,
+                  "reference_fingerprint":context["reference_fingerprint"],"layout_id":context["layout_id"],
+                  "confirmation_basis":basis,"confirmation_reason":reason,"camera_compatible":False,
+                  "matches":[],"robot":robot_difference(reference, observation.state, tolerances)}
+        current_layout = context.get("live_state_layout", reference.get("state_description", ""))
+        if current_layout != reference.get("state_description", ""):
+            report["robot"] = {"verified":False,"status":"state_contract_mismatch",
+                               "reference_state_layout":reference.get("state_description", ""),
+                               "current_state_layout":current_layout}
+            if current_layout and reference.get("state_description"):
+                return {**report,"status":"state_contract_mismatch"}
+            report["robot"]["status"] = "state_contract_unavailable"
+        elif reference.get("state_description", "").startswith("TCP xyz meters + Euler xyz radians") and not report["robot"]["verified"]:
+            return {**report,"status":"robot_state_unavailable"}
+        if not isinstance(captured, int) or not 0 <= time.time_ns()-captured <= 3_000_000_000:
+            return {**report,"status":"stale_initial_observation"}
+        observed_serials = _serials(observation.camera_metadata)
+        serial_evidence = {}
+        for role, image in images.items():
+            live = observation.images.get(role)
+            if live is None or live.shape != image.shape:
+                return {**report,"status":"camera_resolution_or_role_mismatch","camera_role":role}
+            expected = reference.get("camera_serials", {}).get(role)
+            actual = observed_serials.get(role)
+            serial_evidence[role] = {"expected":expected,"actual":actual}
+            if expected and str(expected) != str(actual):
+                return {**report,"status":"camera_identity_mismatch","camera_role":role,"cameras":serial_evidence}
+        report.update(camera_compatible=True,cameras=serial_evidence)
+        for role in sorted({item["role"] for item in objects}):
+            report["matches"].extend(match_objects(images[role], observation.images[role],
+                [item for item in objects if item["role"] == role], tolerance_px=tolerance, min_score=score))
+        if report["robot"].get("verified") and not report["robot"]["passed"]:
+            return {**report,"status":"robot_state_mismatch"}
+        if basis == "matched_regions" and not all(item["aligned"] for item in report["matches"]):
+            return {**report,"status":"objects_changed_after_home"}
+        return {**report,"passed":True,"status":"matched_initial_observation" if basis == "matched_regions" else "operator_visual_approval"}
+    return check
+
+
 class SceneMatchingPanel(ttk.Frame):
     """A session-independent, bidirectional saved-rollout placement workbench."""
     def __init__(self, parent, app, results_root=None):
@@ -306,6 +452,7 @@ class SceneMatchingPanel(ttk.Frame):
         self._reference_preview = None
         self._drag = None
         self._armed = False
+        self._approval = {}
         self._match_stamp = None
         self._match_measured_ns = None
         self._match_parameters = None
@@ -316,7 +463,8 @@ class SceneMatchingPanel(ttk.Frame):
         self._live_signature = None
         self._scan_errors = []
         self._closed = False
-        self.status = tk.StringVar(value="Choose a saved rollout, then match the objects to its initial scene.")
+        self.scene_load_pending = False
+        self.status = tk.StringVar(value="Choose a saved scene, or prepare the robot and capture a new setup.")
         self.summary = tk.StringVar(value="No reference selected")
         self.robot_summary = tk.StringVar(value="Robot pose comparison appears with live state feedback.")
         self.search = tk.StringVar(value="")
@@ -329,6 +477,10 @@ class SceneMatchingPanel(ttk.Frame):
         self.object_label = tk.StringVar(value="Object 1")
         self.tolerance = tk.StringVar(value="8")
         self.min_score = tk.StringVar(value="0.65")
+        self.translation_mm = tk.StringVar(value="5")
+        self.rotation_deg = tk.StringVar(value="3")
+        self.gripper_ratio = tk.StringVar(value="0.05")
+        self.override_reason = tk.StringVar(value="")
         self.grid(row=0, column=0, sticky="nsew")
         parent.columnconfigure(0, weight=1); parent.rowconfigure(0, weight=1)
         content = self.content = app._scrollable_content(self, fill_height=True)
@@ -341,7 +493,10 @@ class SceneMatchingPanel(ttk.Frame):
         self.scan_button = ttk.Button(top, text="Saved rollouts", width=0, command=self.scan)
         self.open_layout_button = ttk.Button(top, text="Load layout", width=0, command=self.load_layout)
         self.clear_pairing_button = ttk.Button(top, text="Clear pairing", width=0, command=self.clear_pairing)
-        self._toolbar_buttons = (self.browse_button, self.scan_button, self.open_layout_button, self.clear_pairing_button)
+        self.prepare_button = ttk.Button(top, text="Prepare start", width=0, command=self.prepare_start)
+        self.capture_button = ttk.Button(top, text="Capture setup", width=0, command=self.capture_setup)
+        self._toolbar_buttons = (self.browse_button, self.scan_button, self.open_layout_button,
+                                 self.clear_pairing_button, self.prepare_button, self.capture_button)
         for column, button in enumerate(self._toolbar_buttons): button.grid(row=0, column=column, sticky="ew", padx=(0, 4))
         self.pane = app._pane(content, key="scene_matching", orient="vertical", first_label="Saved rollouts",
                               second_label="Placement", first_min=125, second_min=430,
@@ -437,12 +592,25 @@ class SceneMatchingPanel(ttk.Frame):
         ttk.Entry(self.similarity_fields, textvariable=self.min_score, width=5).pack(side="left", padx=4)
         self.remove_button = ttk.Button(options, text="Remove region", width=0, command=self.remove_region)
         self.check_button = ttk.Button(options, text="Check placement", width=0, command=lambda:self._submit_match(force=True))
+        self.robot_fields = ttk.Frame(options)
+        self.robot_parameter_fields = []
+        for label, variable in (("Position mm", self.translation_mm), ("Rotation °", self.rotation_deg), ("Gripper Δ", self.gripper_ratio)):
+            field = ttk.Frame(self.robot_fields)
+            ttk.Label(field, text=label, style="Caption.TLabel").pack(side="left")
+            ttk.Entry(field, textvariable=variable, width=5).pack(side="left", padx=(4, 8))
+            self.robot_parameter_fields.append(field)
         footer = self.footer = ttk.Frame(parent); footer.grid(row=7, sticky="ew", pady=(8, 0)); footer.columnconfigure(1, weight=1)
         ttk.Label(footer, text="Layout ID").grid(row=0, column=0, padx=(0, 8))
         ttk.Entry(footer, textvariable=self.layout_id, width=1).grid(row=0, column=1, sticky="ew")
         ttk.Button(footer, text="Save layout", width=0, command=self.save_layout).grid(row=0, column=2, padx=(4, 0))
+        self.override_fields = ttk.Frame(footer)
+        self.override_fields.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.override_fields.columnconfigure(1, weight=1)
+        ttk.Label(self.override_fields, text="Visual override reason", style="Caption.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.override_entry = ttk.Entry(self.override_fields, textvariable=self.override_reason, width=1)
+        self.override_entry.grid(row=0, column=1, sticky="ew")
         self.use_button = ttk.Button(footer, text="Use for next rollout", style="Accent.TButton", command=self.use_reference)
-        self.use_button.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.use_button.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
     def _set_status(self, value):
         if self.status.get() != value:
@@ -477,7 +645,9 @@ class SceneMatchingPanel(ttk.Frame):
                     self._work(operation, next_callback, busy_text=busy_text)
                     continue
                 if generation != self._generation or callback is None: continue
-                if error: self._set_status(error)
+                if error:
+                    self.scene_load_pending = False
+                    self._set_status(error)
                 else: callback(result)
         except queue.Empty: pass
         self._poll_job = self.app.root.after(80, self._poll)
@@ -495,6 +665,7 @@ class SceneMatchingPanel(ttk.Frame):
         return self._work(lambda:index_rollouts(root, cancel=cancel), self._scanned, busy_text="Reading saved rollouts…")
 
     def _scanned(self, payload):
+        self.scene_load_pending = False
         self.records, self._scan_errors = payload
         tasks = sorted({row["task"] for row in self.records})
         methods = sorted({row["method"] for row in self.records})
@@ -528,6 +699,7 @@ class SceneMatchingPanel(ttk.Frame):
         self._work(lambda:load_reference(root, record), self._loaded, busy_text="Loading the recorded initial scene…")
 
     def _loaded(self, payload):
+        self.scene_load_pending = False
         self._clear_reference()
         self.reference, self.images = payload
         self._controls_geometry = None
@@ -536,8 +708,10 @@ class SceneMatchingPanel(ttk.Frame):
         if self.role.get() not in roles: self.role.set(roles[0])
         self.layout_id.set("layout_" + self.reference["record_id"][:8])
         legacy = self.reference["source_kind"].startswith("legacy")
+        setup = self.reference["source_kind"] == "setup_capture"
         self.summary.set(f"{self.reference['task']} · {self.reference['method']} · {self.reference['checkpoint']} · Run {self.reference['rollout_id']}\n"
-                         + ("Legacy video frame · compressed image, approximate initial reference" if legacy
+                         + ("Explicit setup capture · measured state, no policy rollout" if setup else
+                            "Legacy video frame · compressed image, approximate initial reference" if legacy
                             else "Exact first policy observation · captured after Home"))
         self._set_status("Match the saved scene visually, or draw regions around individual objects.")
         self.pane.collapse("first", persist=False)
@@ -545,15 +719,21 @@ class SceneMatchingPanel(ttk.Frame):
 
     def _clear_reference(self):
         self._generation += 1
+        self.scene_load_pending = False
         self.reference, self.images, self.objects, self.matches = None, {}, [], []
         self._armed, self._match_stamp, self._render_key = False, None, None
+        self._approval = {}
+        self.override_reason.set("")
         self._reference_preview = None
         self._match_measured_ns = None
+        self._match_parameters = None
         self.objects_table.delete(*self.objects_table.get_children()) if hasattr(self, "objects_table") else None
         if hasattr(self.app, "set_trial_context"): self.app.set_trial_context({"scene_match": None})
 
     def bind_session(self, session):
         self._generation += 1
+        self.scene_load_pending = False
+        self._pending_work = None
         self._armed = False
         self.matches = []
         self.latest = None
@@ -563,14 +743,12 @@ class SceneMatchingPanel(ttk.Frame):
             self._set_status("Policy changed. Check the current scene and explicitly use the reference again.")
 
     def _view_changed(self):
-        self._generation += 1
         self._controls_geometry = None
         self.app.preferences.set("scene_camera_role", self.role.get())
         self.app.preferences.set("scene_view", self.mode.get())
         self.app.preferences.flush()
-        self.matches = []
-        self._match_stamp = None
-        self._match_measured_ns = None
+        # Camera/view changes only change presentation. A single matching job
+        # covers every declared role, so switching tabs must not erase evidence.
         self._render_key = None
         self._render()
 
@@ -580,8 +758,52 @@ class SceneMatchingPanel(ttk.Frame):
 
     def clear_pairing(self):
         self._armed = False
+        self._approval = {}
         self.app.set_trial_context({"scene_match": None})
         self._set_status("Pairing cleared. The reference remains visible for comparison.")
+
+    def capture_setup(self):
+        """Capture measured idle input without homing, resetting or calling a policy."""
+        with self.app.session.lock:
+            session = self.app.session
+            if session.state != "READY" or session.latest is None:
+                self._set_status("Load a policy and wait for Ready before capturing the measured setup.")
+                return False
+            observation = copy.deepcopy(session.latest)
+            metadata = copy.deepcopy(getattr(session.embodiment, "metadata", {}))
+            task, instruction = session.config.task, session.config.instruction
+            previous = self.app.trial_context
+        if not np.asarray(observation.state).size or getattr(observation, "preview_only", False):
+            self._set_status("Robot state is unavailable; camera-only preview cannot define a starting state.")
+            return False
+        root = self.results_root
+        serials = {**metadata.get("camera_serials", {}), **_serials(observation.camera_metadata)}
+        self._clear_reference()
+        self.scene_load_pending = True
+        def operation():
+            return save_setup_reference(root, observation, task=task, instruction=instruction,
+                state_description=metadata.get("state", ""), camera_serials=serials,
+                home_joints=metadata.get("home_joints"), previous_trial_context=previous)
+        self._work(operation, self._loaded, busy_text="Saving the measured setup; no robot motion or policy inference…")
+        return True
+
+    def prepare_start(self):
+        prepare = getattr(self.app.session, "prepare_start", None)
+        if prepare is None or not getattr(self.app.session, "can_home", False):
+            self._set_status("Wait for Ready before preparing the starting pose.")
+            return False
+        self.clear_pairing()
+        if not prepare():
+            self._set_status("Starting-pose preparation is unavailable during another operation.")
+            return False
+        message = "Open gripper + task home; no rollout. Arrange objects, then capture the setup."
+        self._set_status(message)
+        self.app.status.set(message)
+        return True
+
+    def scene_ready(self, fingerprint):
+        return bool(not self.scene_load_pending and self.reference and
+                    self.reference.get("reference_fingerprint") == fingerprint)
 
     def _layout_controls(self):
         width = max(200, self.content.winfo_width()-16)
@@ -589,11 +811,12 @@ class SceneMatchingPanel(ttk.Frame):
         if key == self._controls_geometry: return
         self._controls_geometry = key
         button_width = max(button.winfo_reqwidth() for button in self._toolbar_buttons)+4
-        columns = max(1, min(4, width//button_width))
-        if columns == 3: columns = 2  # Two complete rows avoid an orphan action.
-        for column in range(4): self.toolbar.columnconfigure(column, weight=1 if column<columns else 0, uniform="scene_tools" if column<columns else "")
+        columns = max(1, min(6, width//button_width))
+        if columns in {4,5}: columns = 3
+        for column in range(6): self.toolbar.columnconfigure(column, weight=1 if column<columns else 0, uniform="scene_tools" if column<columns else "")
         for index,button in enumerate(self._toolbar_buttons):
-            button.grid(row=index//columns, column=index%columns, sticky="ew", padx=(0,4 if index%columns<columns-1 else 0), pady=(0,4))
+            span = columns if index == len(self._toolbar_buttons)-1 and index%columns == 0 else 1
+            button.grid(row=index//columns, column=index%columns, columnspan=span, sticky="ew", padx=(0,4 if span==1 and index%columns<columns-1 else 0), pady=(0,4))
         wide = width >= 800+max(0, self.app.text_size-14)*20
         surface = self.matching_surface
         # Treeview's stretch column rewrites its requested width after a
@@ -618,6 +841,11 @@ class SceneMatchingPanel(ttk.Frame):
         self.tolerance_fields.grid(row=0, column=0, columnspan=2 if narrow else 1, sticky="w")
         self.similarity_fields.grid(row=1 if narrow else 0, column=0 if narrow else 1, columnspan=2 if narrow else 1, sticky="w")
         action_row = 2 if narrow else 1
+        self.robot_fields.grid(row=action_row, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        per_row = max(1,min(3,form_width//max(field.winfo_reqwidth() for field in self.robot_parameter_fields)))
+        for index, field in enumerate(self.robot_parameter_fields):
+            field.grid(row=index//per_row, column=index%per_row, sticky="w")
+        action_row += 1
         stack_actions = self.remove_button.winfo_reqwidth()+self.check_button.winfo_reqwidth()+8 > form_width
         self.remove_button.grid(row=action_row, column=0, columnspan=2 if stack_actions else 1, sticky="ew", padx=(0,0 if stack_actions else 4), pady=(4,0))
         self.check_button.grid(row=action_row+1 if stack_actions else action_row, column=0 if stack_actions else 1, columnspan=2 if stack_actions else 1, sticky="ew", pady=(4,0))
@@ -676,8 +904,16 @@ class SceneMatchingPanel(ttk.Frame):
             self.content.resize_viewport()
         valid, reason = self._compatibility()
         idle = self.app.session.state in {"READY", "SELECTING", "CAMERA_ERROR", "RECOVERY_REQUIRED"}
-        state = "normal" if valid and idle else "disabled"
+        state = "normal" if valid and self.app.session.state in {"READY", "SELECTING"} and not self.scene_load_pending else "disabled"
         if str(self.use_button.cget("state")) != state: self.use_button.configure(state=state)
+        use_label = "Use matched / reviewed layout" if self.objects else "Use visual reference"
+        if self.use_button.cget("text") != use_label: self.use_button.configure(text=use_label)
+        if self.objects: self.override_fields.grid()
+        else: self.override_fields.grid_remove()
+        capture_state = "normal" if self.app.session.state == "READY" and not self.scene_load_pending else "disabled"
+        if str(self.capture_button.cget("state")) != capture_state: self.capture_button.configure(state=capture_state)
+        prepare_state = "normal" if getattr(self.app.session, "can_home", False) else "disabled"
+        if str(self.prepare_button.cget("state")) != prepare_state: self.prepare_button.configure(state=prepare_state)
         if self._armed and not valid:
             self._armed = False
             self.app.set_trial_context({"scene_match": None})
@@ -686,9 +922,9 @@ class SceneMatchingPanel(ttk.Frame):
             self._set_status(reason)
         self._last_compatibility_note = reason
         self._robot_comparison()
-        if not self.winfo_viewable(): return
-        self._render()
-        if valid and idle: self._submit_match()
+        visible = self.winfo_viewable()
+        if visible: self._render()
+        if valid and idle and (visible or self._armed): self._submit_match()
 
     def _robot_comparison(self):
         state = np.asarray(getattr(self.latest, "state", []))
@@ -699,35 +935,81 @@ class SceneMatchingPanel(ttk.Frame):
             description = getattr(self.app.session.embodiment, "metadata", {}).get("state", "")
             reference_description = self.reference.get("state_description", "")
             if state.size == 7 and description == reference_description and description.startswith("TCP xyz meters + Euler xyz radians"):
-                translation = float(np.linalg.norm(state[:3]-reference[:3]))*1000
-                angle = np.abs((state[3:6]-reference[3:6]+np.pi)%(2*np.pi)-np.pi).max()*180/np.pi
-                text = f"Robot Δposition {translation:.1f} mm · max Euler Δ {angle:.1f}° · gripper Δ {abs(state[6]-reference[6]):.3f}\nHome/reset → align objects → associate reference → Start. Start homes again; the actual first observation is recorded."
+                delta = robot_difference(self.reference, state, {"translation_mm":5.,"rotation_deg":3.,"gripper_ratio":.05})
+                text = f"Robot Δposition {delta['translation_mm']:.1f} mm · orientation Δ {delta['rotation_deg']:.1f}° · gripper Δ {delta['gripper_ratio_delta']:.3f}\nHome → arrange objects → capture or use a reference → Start. Start checks its actual post-Home input before policy execution."
             else:
                 text = f"Robot state max |Δ| {np.max(np.abs(state-reference)):.4g} · units follow the embodiment. Image alignment cannot verify depth."
         else:
             text = "Saved robot state is unavailable or uses a different dimension. Image alignment cannot verify depth."
         if self.robot_summary.get() != text: self.robot_summary.set(text)
 
+    def _robot_tolerances(self):
+        try:
+            values = {"translation_mm":float(self.translation_mm.get()), "rotation_deg":float(self.rotation_deg.get()),
+                      "gripper_ratio":float(self.gripper_ratio.get())}
+        except ValueError:
+            raise ValueError("Enter numeric robot starting-state tolerances") from None
+        if any(not math.isfinite(value) or value <= 0 for value in values.values()):
+            raise ValueError("Robot starting-state tolerances must be finite and positive")
+        return values
+
+    def _approval_signature(self, parameters, tolerances):
+        return _digest(json.dumps({"reference":self.reference["reference_fingerprint"],
+            "state":self.reference.get("initial_state"), "state_layout":self.reference.get("state_description"),
+            "objects":self.objects, "matching_parameters":parameters, "robot_tolerances":tolerances}, sort_keys=True).encode())
+
+    @staticmethod
+    def _approval_problem(context):
+        alignment = context["alignment"]
+        if not alignment.get("camera_compatible"):
+            return "Camera or task no longer matches the reference"
+        if not alignment.get("operator_confirmed"):
+            return "Confirm the changed layout and parameters again before Start"
+        basis = alignment.get("confirmation_basis")
+        if basis == "matched_regions":
+            if alignment["status"] != "aligned_in_image":
+                return "Object placement changed or its measurement is stale; check placement again"
+        elif basis in {"visual_override", "visual_only"}:
+            if not 0 <= time.time_ns()-alignment.get("confirmed_ns", 0) <= 60_000_000_000:
+                return "Visual confirmation expired; inspect the current scene and use the reference again"
+            if basis == "visual_override" and not alignment.get("confirmation_reason", "").strip():
+                return "Explain the visual override before Start"
+        else:
+            return "Choose how this starting scene was verified"
+        return None
+
     def _submit_match(self, force=False):
         if self._busy or self._closed or not self.objects or not self._compatibility()[0]: return False
-        stamp = (self.role.get(), self.latest.captured_ns)
+        stamp = self.latest.captured_ns
         if not force and (stamp == self._match_stamp or time.monotonic()-self._last_match < .4): return False
-        role = self.role.get()
-        objects = copy.deepcopy([item for item in self.objects if item["role"] == role])
-        if not objects: return False
+        objects = copy.deepcopy(self.objects)
         try: tolerance, score = float(self.tolerance.get()), float(self.min_score.get())
         except ValueError:
             self._set_status("Enter numeric pixel tolerance and similarity threshold")
             return False
-        reference, live = self.images[role].copy(), self.latest.images[role].copy()
+        roles = {item["role"] for item in objects}
+        reference = {role:self.images[role].copy() for role in roles}
+        live = {role:self.latest.images[role].copy() for role in roles}
         self._last_match, self._match_stamp = time.monotonic(), stamp
         captured_ns = self.latest.captured_ns
-        return self._work(lambda:(match_objects(reference, live, objects, tolerance_px=tolerance, min_score=score), captured_ns, (tolerance, score)), self._matched)
+        def match_all():
+            rows = []
+            for role in sorted(roles):
+                selected = [item for item in objects if item["role"] == role]
+                rows.extend({**row, "measured_ns":captured_ns} for row in
+                    match_objects(reference[role], live[role], selected, tolerance_px=tolerance, min_score=score))
+            return rows, captured_ns, (tolerance, score)
+        return self._work(match_all, self._matched)
 
     def _matched(self, payload):
         rows, self._match_measured_ns, self._match_parameters = payload
         self.matches = rows
         self._update_object_rows()
+        remaining = sum(not row["aligned"] for row in self.matches)
+        self._set_status((f"Associated {self.layout_id.get()} · " if self._armed else "")
+                         + f"Checked {len(self.matches)} objects across {len({row['role'] for row in self.matches})} views · "
+                         + (f"{remaining} need placement review" if remaining else "All regions aligned in the images")
+                         + ". Move toward the solid outline.")
         self._render_key = None
         self._render()
 
@@ -878,13 +1160,19 @@ class SceneMatchingPanel(ttk.Frame):
             raise ValueError("Use positive pixel tolerance and similarity in (0, 1]")
         if self.objects and self._match_parameters != parameters:
             status = "not_recently_checked"
+        tolerances = self._robot_tolerances()
+        signature = self._approval_signature(parameters, tolerances)
+        approval_current = self._armed and self._approval.get("approval_signature") == signature
         return {"schema_version": 1, "layout_id": layout, "results_root": str(self.results_root),
                 "reference": copy.deepcopy({key:value for key,value in self.reference.items() if key != "reference_fingerprint"}),
                 "reference_fingerprint": self.reference["reference_fingerprint"], "objects": copy.deepcopy(self.objects),
+                "robot_tolerances": tolerances,
+                "live_state_layout": getattr(self.app.session.embodiment, "metadata", {}).get("state", ""),
                 "display": {"role": self.role.get(), "mode": self.mode.get(), "blend": self.opacity.get()},
                 "alignment": {"role": self.role.get(), "measured_ns": self._match_measured_ns, "status": status,
                               "matches": matches, "camera_compatible": valid, "camera_note": reason,
-                              "operator_confirmed": self._armed, "pixel_tolerance": self.tolerance.get(),
+                              "operator_confirmed": approval_current, **copy.deepcopy(self._approval),
+                              "pixel_tolerance": self.tolerance.get(),
                               "similarity_threshold": self.min_score.get(),
                               "unchecked_object_ids": sorted({item["id"] for item in self.objects}-checked_ids),
                               "confirmation_scope": "Operator associated this reference; physical pose equality is not certified",
@@ -897,22 +1185,54 @@ class SceneMatchingPanel(ttk.Frame):
         if self.app.session.state not in {"READY", "SELECTING"}:
             self._set_status("Associate a reference while idle"); return False
         try:
+            self._armed = False
+            self._approval = {}
+            self.app.set_trial_context({"scene_match":None})
+            context = self.reference_context()
+            reason = self.override_reason.get().strip()
+            if len(reason) > 500:
+                raise ValueError("Keep the visual override reason under 500 characters")
+            if not self.objects:
+                basis = "visual_only"
+            elif context["alignment"]["status"] == "aligned_in_image":
+                basis = "matched_regions"
+            elif reason:
+                basis = "visual_override"
+            else:
+                raise ValueError("Some regions are unmatched, misplaced or stale. Check placement, or enter a visual override reason.")
+            self._approval = {"confirmation_basis":basis, "confirmation_reason":reason,
+                              "confirmed_ns":time.time_ns(), "approval_signature":self._approval_signature(
+                                  (float(self.tolerance.get()),float(self.min_score.get())), self._robot_tolerances())}
             self._armed = True
             context = self.reference_context()
             accepted = self.app.set_trial_context({"scene_match": context})
             if accepted is False: raise RuntimeError("The current session cannot accept a reference yet")
         except (ValueError, RuntimeError) as error:
             self._armed = False; self._set_status(str(error)); return False
-        self._set_status(f"Layout {context['layout_id']} is associated. Start homes again; its actual first observation will be saved. The pairing does not certify equal 3-D placement.")
+        label = {"matched_regions":"Object regions matched", "visual_only":"Visual-only confirmation", "visual_override":"Visual override recorded"}[basis]
+        self._set_status(f"{label} · {context['layout_id']}. Start verifies the actual post-Home input before any policy action.")
         return True
 
     def before_start(self):
-        if not self._armed: return True
+        if self.scene_load_pending:
+            self._set_status("Wait for the requested starting scene to finish loading before Start.")
+            return False
+        setter = getattr(self.app.session, "set_initial_observation_check", None)
+        if not self._armed:
+            if setter is not None: setter(None)
+            return True
         valid, reason = self._compatibility()
         if not valid:
             self._set_status(reason); return False
-        self.app.set_trial_context({"scene_match": self.reference_context()})
-        return True
+        try:
+            context = self.reference_context()
+            problem = self._approval_problem(context)
+            if problem: raise ValueError(problem)
+            if setter is None or not setter(build_initial_checker(context, self.images)):
+                raise ValueError("Starting-scene verification cannot be armed while this operation is active")
+            return self.app.set_trial_context({"scene_match": context})
+        except (ValueError, TypeError) as error:
+            self._set_status(str(error)); return False
 
     def save_layout(self):
         try:
@@ -930,38 +1250,75 @@ class SceneMatchingPanel(ttk.Frame):
     def load_layout(self):
         path = filedialog.askopenfilename(parent=self.app.root, initialdir=self.results_root / ".layouts" if (self.results_root / ".layouts").is_dir() else self.results_root, filetypes=(("Scene layout", "*.json"),), title="Load placement layout")
         if not path: return
-        root = self.results_root
-        def operation():
+        try:
             document = _json(path)
             if document.get("kind") != "recorded_scene_layout" or document.get("schema_version") != 1:
                 raise ValueError("Choose a recorded scene layout")
+        except (OSError, ValueError) as error:
+            self._set_status(str(error)); return False
+        return self.load_scene_context(document)
+
+    def load_scene_context(self, document, *, results_root=None):
+        """Restore a campaign's reference and ROIs; association remains explicit.
+
+        True means the request was accepted, including queued work. Call
+        scene_ready(fingerprint) before arming; loading never starts motion.
+        """
+        if self._closed or self.app.session.state not in {"READY", "SELECTING"}:
+            self._set_status("Finish the current operation before loading a starting scene.")
+            return False
+        document = copy.deepcopy(document)
+        if not isinstance(document, dict) or document.get("schema_version") != 1:
+            self._set_status("Choose a supported saved scene context.")
+            return False
+        root = Path(results_root).expanduser().resolve() if results_root is not None else self.results_root
+        if not root.is_dir():
+            self._set_status("The campaign's reference folder is unavailable.")
+            return False
+        if root != self.results_root:
+            self.results_root = root
+            self.records, self._visible_records = [], {}
+            self.table.delete(*self.table.get_children())
+        self._clear_reference()
+        self.scene_load_pending = True
+        def operation():
             # Resolve against the current chosen root so a copied layout remains
             # portable and cannot silently redirect the browser elsewhere.
             reference, images = load_reference(root, document["reference"])
             if document.get("reference_fingerprint") != reference["reference_fingerprint"]:
                 raise ValueError("The layout's initial images or camera identity changed")
+            for key in ("initial_state", "state_description"):
+                if key in document["reference"] and document["reference"][key] != reference.get(key):
+                    raise ValueError("The layout's recorded robot state or its units changed")
             objects = validate_objects(document.get("objects", []), images)
             display = document.get("display", {})
             role = display.get("role", document.get("alignment", {}).get("role", next(iter(images))))
             mode, blend = display.get("mode", "Overlay"), float(display.get("blend", .5))
             tolerance = float(document.get("alignment", {}).get("pixel_tolerance", 8))
             score = float(document.get("alignment", {}).get("similarity_threshold", .65))
+            robot_tolerances = document.get("robot_tolerances", {"translation_mm":5.0,"rotation_deg":3.0,"gripper_ratio":.05})
+            if set(robot_tolerances) != {"translation_mm", "rotation_deg", "gripper_ratio"} or any(not math.isfinite(float(value)) or float(value) <= 0 for value in robot_tolerances.values()):
+                raise ValueError("Unsupported saved robot starting-state tolerances")
             if role not in images or mode not in {"Overlay", "Side by side", "Reference", "Live"} or not 0 <= blend <= 1:
                 raise ValueError("Unsupported saved camera or display setting")
             if not math.isfinite(tolerance) or tolerance <= 0 or not 0 < score <= 1:
                 raise ValueError("Unsupported saved matching parameters")
-            return document, reference, images, objects, (role, mode, blend, tolerance, score)
+            return document, reference, images, objects, (role, mode, blend, tolerance, score, robot_tolerances)
         def loaded(payload):
             document, reference, images, objects, settings = payload
             self._loaded((reference, images)); self.objects = objects
             self.layout_id.set(document["layout_id"])
-            role, mode, blend, tolerance, score = settings
+            role, mode, blend, tolerance, score, robot_tolerances = settings
             self.role.set(role); self.mode.set(mode); self.opacity.set(blend)
             self.tolerance.set(f"{tolerance:g}"); self.min_score.set(f"{score:g}")
+            self.translation_mm.set(f"{float(robot_tolerances['translation_mm']):g}")
+            self.rotation_deg.set(f"{float(robot_tolerances['rotation_deg']):g}")
+            self.gripper_ratio.set(f"{float(robot_tolerances['gripper_ratio']):g}")
             self._update_object_rows()
             self._submit_match(force=True); self._render_key = None; self._render()
             self._set_status("Layout loaded. Compare the live scene, then use it for the next rollout.")
         self._work(operation, loaded, busy_text="Reading saved placement layout…")
+        return True
 
     def prepare_close(self):
         if self._closed: return

@@ -74,6 +74,34 @@ class Sessions(unittest.TestCase):
         self.assertEqual(len(session.results),1)
         self.assertEqual(len(list(session.folder.glob("rollout_*"))),1)
 
+    def test_prepare_start_opens_gripper_without_rollout_or_policy_reset(self):
+        class Robot(MockEmbodiment):
+            def home_idle(self, cancel):
+                gripper = self.state[6]
+                self.home(cancel)
+                self.state[6] = gripper
+        class Policy(MockPolicy):
+            resets = 0
+            def reset(self, episode_id):
+                self.resets += 1
+                super().reset(episode_id)
+        robot, policy = Robot(), Policy()
+        session = self.make(policy=policy, embodiment=robot)
+        robot.state[6] = 1.
+        self.assertTrue(session.home_robot())
+        self.wait(lambda: session.state == "READY" and robot.home_count == 1)
+        self.assertEqual(robot.state[6], 1.)
+        self.assertTrue(session.prepare_start())
+        self.assertFalse(session.prepare_start())
+        self.wait(lambda: session.state == "READY" and robot.home_count == 2)
+        self.assertEqual(robot.state[6], 0.)
+        self.assertEqual(policy.resets, 0)
+        self.assertEqual(policy.steps, 0)
+        self.assertFalse(robot._episode_active)
+        self.assertEqual(robot.applied, [])
+        self.assertEqual(session.results, [])
+        self.assertEqual(session.attempt_records, [])
+
     def test_experiment_context_and_exact_initial_input_survive_outcome_and_delete(self):
         from PIL import Image
         import hashlib
@@ -141,6 +169,60 @@ class Sessions(unittest.TestCase):
         self.assertEqual(result["attempt_backbone_calls"], 1)
         self.assertTrue(result["backbone_count_complete"])
         self.assertEqual(result["policy_inferences_completed"], 1)
+
+    def test_start_layout_check_uses_post_home_input_and_rejects_before_policy(self):
+        policy = MockPolicy()
+        session = self.make(policy=policy, steps=1)
+        session.set_trial_context({"scene_match": {"layout_id": "matched-start"}})
+        observed = []
+        def check(observation):
+            observed.append((session.embodiment.home_count, observation.captured_ns))
+            return {"passed": False, "status": "object_shifted", "offset_px": [20, 0]}
+        session.set_initial_observation_check(check)
+        session.start_rollout()
+        self.wait(lambda: session.state == "READY" and bool(session.attempt_records))
+        self.assertEqual(policy.steps, 0)
+        self.assertEqual(session.embodiment.applied, [])
+        self.assertEqual(session.results, [])
+        attempt = session.attempt_records[0]
+        self.assertEqual(attempt["outcome"], "aborted")
+        self.assertEqual(attempt["abort_reason"], "initial_scene_mismatch")
+        self.assertEqual(attempt["outcome_source"], "automatic_setup_rejection")
+        self.assertFalse(attempt["policy_started"])
+        self.assertEqual(attempt["attempt_backbone_calls"], 0)
+        folder = session.folder / attempt["directory"]
+        self.assertEqual(observed[0][0], 1)
+        self.assertEqual(observed[0][1], json.loads((folder/"initial_state.json").read_text())["captured_ns"])
+        self.assertFalse(json.loads((folder/"initial_alignment.json").read_text())["passed"])
+        self.assertEqual(json.loads((folder/"steps.jsonl").read_text().splitlines()[0])["step_status"], "setup_rejected")
+        # Clearing the pairing also clears the registered check; it cannot
+        # accidentally veto a later ordinary rollout.
+        session.set_trial_context(None)
+        session.start_rollout()
+        self.wait(lambda: session.state == "WAITING_OUTCOME")
+        session.signal("success")
+        self.wait(lambda: session.state == "READY")
+        self.assertEqual(policy.steps, 1)
+        self.assertEqual(len(observed), 1)
+
+    def test_stop_during_initial_check_never_runs_policy_or_rearms(self):
+        entered, release = threading.Event(), threading.Event()
+        session = self.make(steps=1)
+        session.set_trial_context({"scene_match": {"layout_id": "matched-start"}})
+        def check(_observation):
+            entered.set(); release.wait(2)
+            return {"passed": True, "status": "matched"}
+        session.set_initial_observation_check(check)
+        session.start_rollout()
+        self.wait(entered.is_set)
+        self.assertEqual(session.state, "HOMING")
+        self.assertFalse(session.signal("success"))
+        session.signal("stop")
+        release.set()
+        self.wait(lambda: session.state == "READY" and bool(session.attempt_records))
+        self.assertEqual(session.policy.steps, 0)
+        self.assertEqual(session.embodiment.applied, [])
+        self.assertFalse(session.attempt_records[0]["policy_started"])
 
     def test_unknown_failed_inference_calls_are_not_invented_as_zero(self):
         class FailedInfer(MockPolicy):

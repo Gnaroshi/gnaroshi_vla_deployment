@@ -260,6 +260,26 @@ class CheckpointReload(unittest.TestCase):
         self.assertEqual(self.app.reload_vars["checkpoint"].get(), "checkpoint_b")
         self.assertGreaterEqual(self.app.details.winfo_height(), 80)
 
+    def test_workflow_navigation_survives_explicit_checkpoint_replacement_without_motion(self):
+        old = self.make_session()
+        self.app = DeploymentGUI(self.root, old,
+            reload_fields=[{"key": "checkpoint", "label": "Checkpoint", "kind": "directory"}],
+            reload_factory=self.replacement, extra_tabs=[("Calibration", lambda _parent, _app: object())])
+        self.wait(lambda: old.state == "READY")
+        for number, title in enumerate(("Match layout", "Calibration")):
+            previous = self.app.session
+            self.app.main_pane.collapse("second", persist=False)
+            self.assertTrue(self.app.show_tab(title))
+            self.assertNotIn("second", self.app.main_pane.collapsed)
+            self.app.reload_vars["checkpoint"].set(f"workflow_{number}")
+            self.assertTrue(self.app.load_checkpoint())
+            self.assertEqual(self.app.tabs.tab(self.app.tabs.select(), "text"), title)
+            self.wait(lambda: self.app.session is not previous and self.app.session.state == "READY"
+                      and not self.app._reload_in_progress)
+            self.assertEqual(self.app.tabs.tab(self.app.tabs.select(), "text"), title)
+            self.assertEqual(self.app.session.embodiment.home_count, 0)
+            self.assertEqual(self.app.session.results, [])
+
     def test_reload_is_blocked_during_home_rollout_and_stopping(self):
         home_entered, home_release = threading.Event(), threading.Event()
         stop_entered, stop_release = threading.Event(), threading.Event()

@@ -202,7 +202,7 @@ def summary(rows):
     backbone_calls = sum(r.get("backbone_call_delta") or 0 for r in rows) if any(r.get("backbone_calls") is not None or (r.get("backbone_call_delta") or 0)>0 for r in rows) else None
     return {"steps": len(rows), "achieved_command_hz": actual,
             "active_duration_s": times[-1]-times[0] if len(times)>1 else 0.0,
-            "latency": {key: stats(key) for key in ("capture_ms", "policy_ms", "rpc_ms", "rpc_overhead_ms", "server_infer_ms", "model_gpu_ms", "command_ms", "work_ms", "media_write_ms", "loop_work_ms")},
+            "latency": {key: stats(key) for key in ("capture_ms", "policy_ms", "rpc_ms", "rpc_overhead_ms", "server_infer_ms", "model_gpu_ms", "command_ms", "work_ms", "media_write_ms", "loop_work_ms", "initial_snapshot_ms", "initial_alignment_ms")},
             "deadline_misses": sum(r["deadline_miss"] for r in rows),
             "full_calls": backbone_calls, "backbone_calls": backbone_calls,
             "rpc_requests": sum(r.get("rpc_ms") is not None and not r.get("buffered", False) for r in rows),

@@ -117,20 +117,31 @@ Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5
 ### 저장된 시작 장면으로 배치 맞추기
 
 **Match layout**에서 결과 폴더를 선택하고 task/method/checkpoint/rollout으로 기준을 찾는다.
-어느 방법의 rollout이든 기준으로 사용할 수 있다. 현재 robot home과 물체 배치를 먼저
-준비하고, 기준 이미지에서 물체별 영역을 지정한다. Overlay / Side by side로 확인하면서
-픽셀 이동량·일치 신뢰도·로봇 상태 차이를 확인하고 **Use for next rollout**으로 연결한다.
-이 탭은 카메라 관측만 읽으며 로봇을 움직이거나 rollout을 시작하지 않는다.
+어느 방법의 rollout이든 기준으로 사용할 수 있다. **Prepare start**를 명시적으로 누르면
+gripper와 task home을 시작 상태로 준비한다. policy reset·추론·rollout은 실행하지 않는다.
+기존 **Home**은 gripper를 유지한다. **Capture setup**은 준비된 현재 관측을 저장해, 정책을
+한 번도 실행하지 않고도 기준 장면을 만들 수 있다. 저장은 `results_root/_layouts/captures`에
+하며 가상의 성공/실패 기록을 만들지 않는다. 두 버튼 모두 자동으로 호출되지 않는다.
+
+기준 이미지에서 카메라별 물체 영역을 지정하고 Overlay / Side by side로 확인한다.
+픽셀 이동량·일치 신뢰도·로봇 상태 차이를 확인하고 **Use matched / reviewed layout**으로 연결한다.
+카메라 표시를 전환해도 다른 카메라의 영역 검사를 유지한다. 영역이 맞지 않으면 재배치하거나
+시각 확인으로 진행하는 이유를 명시해야 한다. 영역 없이 확인한 경우에도 visual-only임을 기록한다.
 
 영역 기반 CPU 영상 매칭이며 자동 semantic object detector가 아니다. 카메라·task·영상 크기가
 다르거나 반복 무늬·가림으로 불명확하면 일치로 단정하지 않는다. 영상 평면의 일치는
-3D pose·접촉 상태가 같다는 보장이 아니다. Start가 home을 다시 수행하므로 실제 첫 입력을
-최종 근거로 확인한다. 기존 MP4의 첫 프레임은 손실 압축된 legacy reference라고 표시한다.
+3D pose·접촉 상태가 같다는 보장이 아니다. Start가 home을 다시 수행한 뒤 실제 첫 입력을
+검사하고, 불일치 시 정책 action 실행 전에 중단한다. 검사 결과는 `initial_alignment.json`에
+저장한다. UR5e의 기본 허용 오차는 이동 5 mm, 회전 3°, gripper ratio 0.05이며 편집 가능하다.
+알 수 없는 embodiment의 state를 물리 단위로 추정하지 않고 미검증으로 표시한다.
+기존 MP4의 첫 프레임은 손실 압축된 legacy reference라고 표시한다.
 
 새 rollout은 home 후 첫 action **이전의 실제 policy 입력**을 `initial_state.json`과
 `initial_<camera role>.png`에 저장한다. state, camera identity, 이미지 SHA256, 선택한 기준
 장면과 실험 context를 포함한다. 영상 녹화를 꺼도 첫 관측은 남으며 저장 시간은 첫 step의
-`initial_snapshot_ms`로 분리한다. 학습 예시 이미지 탐색 기능도 계속 제공한다.
+`initial_snapshot_ms`, 검사 시간은 `initial_alignment_ms`로 분리한다. 시작 배치 불일치는
+`automatic_setup_rejection`으로 보존하며 실행 전 중단을 성공/실패로 위조하지 않는다.
+학습 예시 이미지 탐색 기능도 계속 제공한다.
 `attempt_backbone_calls`는 action 적용 실패나 중단 전에 이미 반환된 추론의 호출도 포함한다.
 추론 응답을 받지 못해 총량을 알 수 없으면 null과 `backbone_count_complete=false`로 남긴다.
 기존 실행된 command 기준 측정치와 구분하며, 알 수 없는 비용을 0회로 추정하지 않는다.

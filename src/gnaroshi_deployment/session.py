@@ -34,6 +34,8 @@ class DeploymentSession:
         self.attempt_records = []
         self._trial_context = {}
         self._pending_trial_context = {}
+        self._initial_observation_check = None
+        self._pending_initial_observation_check = None
         self.latest = None
         self.error = None
         self.error_detail = None
@@ -426,6 +428,13 @@ class DeploymentSession:
 
     def home_robot(self):
         """Queue an idle pose-only home; never creates a rollout or resets policy."""
+        return self._queue_home(prepare=False)
+
+    def prepare_start(self):
+        """Explicitly prepare the start gripper and pose without running a policy."""
+        return self._queue_home(prepare=True)
+
+    def _queue_home(self, *, prepare):
         with self.lock:
             if not self.can_home:
                 return False
@@ -433,11 +442,11 @@ class DeploymentSession:
             self.cancel.clear()
             self.state = "HOMING"
             generation = self._stop_generation
-        self._journal("idle_home_requested", stop_generation=generation)
-        self.commands.put(("home", generation))
+        self._journal("idle_home_requested", stop_generation=generation, prepare_start=prepare)
+        self.commands.put(("home", generation, prepare))
         return True
 
-    def _home_robot(self, generation):
+    def _home_robot(self, generation, prepare=False):
         if (self.closing.is_set() or self.cancel.is_set() or self.request != "home"
                 or generation != self._stop_generation):
             if self._recovery_fault:
@@ -452,8 +461,9 @@ class DeploymentSession:
             self._check_policy_ready()
             if self.cancel.is_set() or self.closing.is_set() or generation != self._stop_generation:
                 raise InterruptedError("Idle home cancelled")
-            self._state("HOMING", "Moving to task home; no rollout or policy reset")
-            home = getattr(self.embodiment, "home_idle", None)
+            self._state("HOMING", "Preparing start gripper and task home; no rollout or policy reset"
+                        if prepare else "Moving to task home; no rollout or policy reset")
+            home = self.embodiment.home if prepare else getattr(self.embodiment, "home_idle", None)
             if not callable(home):
                 home = self.embodiment.home
             home(self.cancel)
@@ -466,7 +476,7 @@ class DeploymentSession:
                 if isinstance(fault, RobotRecoveryRequired):
                     raise fault
                 raise RuntimeError("Robot did not acknowledge stop after idle home")
-            self._journal("idle_home_completed")
+            self._journal("idle_home_completed", prepare_start=prepare)
             self._ready_after_stop()
         except InterruptedError:
             self._journal("idle_home_cancelled")
@@ -488,6 +498,7 @@ class DeploymentSession:
                 return False
             # Reserve the state before queueing: double-click cannot queue two homes.
             self._pending_trial_context = copy.deepcopy(self._trial_context)
+            self._pending_initial_observation_check = self._initial_observation_check
             self.state = "STARTING"
         self.commands.put("start")
         return True
@@ -511,8 +522,21 @@ class DeploymentSession:
                     or self._rollout_active or self._home_active or self.closing.is_set()):
                 return False
             self._trial_context = clean
+            if not clean.get("scene_match"):
+                self._initial_observation_check = None
             self._journal("trial_context_changed", trial_context=clean)
         return True
+
+    def set_initial_observation_check(self, check):
+        """Register a CPU-only check of the first input; it must not touch devices or UI."""
+        if check is not None and not callable(check):
+            raise ValueError("Initial observation check must be callable")
+        with self.lock:
+            if (self.state not in {"SELECTING", "READY", "CONNECTING"}
+                    or self._rollout_active or self._home_active or self.closing.is_set()):
+                return False
+            self._initial_observation_check = check
+            return True
 
     def signal(self, action):
         if action not in {"success", "failure", "stop", "retry", "close"}:
@@ -1005,7 +1029,7 @@ class DeploymentSession:
                 elif isinstance(command, tuple) and command[0] == "home":
                     self._home_active = True
                     try:
-                        self._home_robot(command[1])
+                        self._home_robot(command[1], command[2] if len(command) > 2 else False)
                     finally:
                         self._home_active = False
                 elif self.state == "READY":
@@ -1110,11 +1134,14 @@ class DeploymentSession:
         phase, step = "start", None
         observation = prediction = None
         start_home_report = None
+        initial_alignment = None
+        setup_abort_reason = None
         policy_started = False
         policy_inferences_started = policy_inferences_completed = 0
         observed_backbone_calls = 0
         backbone_count_complete = True
         trial_context = copy.deepcopy(self._pending_trial_context)
+        initial_check = self._pending_initial_observation_check if trial_context.get("scene_match") else None
         trial_identity = {"task": self.config.task, "method": self.config.method,
                           "state_layout": self.config.metadata.get("state_layout", self.embodiment.metadata.get("state")),
                           "instruction": self.config.instruction,
@@ -1175,7 +1202,10 @@ class DeploymentSession:
                 raise InterruptedError("reset cancelled")
             phase = "begin_episode"
             self.embodiment.begin_episode()
-            self._state("RUNNING")
+            if initial_check is not None:
+                self._state("HOMING", "Checking the actual start layout before any policy action")
+            else:
+                self._state("RUNNING")
             for step in range(self.config.max_steps):
                 if self.cancel.is_set():
                     break
@@ -1193,6 +1223,35 @@ class DeploymentSession:
                     recorder.save_initial(observation, trial_context=trial_context,
                                           camera_serials=camera_serials, identity=trial_identity)
                     initial_snapshot_ms = 1000 * (time.perf_counter() - snapshot_started)
+                    initial_alignment_ms = 0.0
+                    if initial_check is not None:
+                        phase = "initial_alignment"
+                        alignment_started = time.perf_counter()
+                        try:
+                            initial_alignment = initial_check(observation)
+                            if not isinstance(initial_alignment, dict) or type(initial_alignment.get("passed")) is not bool:
+                                raise ValueError("Initial check must return an explicit passed boolean")
+                            initial_alignment = self._json_safe(initial_alignment)
+                        except Exception as error:
+                            initial_alignment = {"passed": False, "status": "check_error",
+                                                 "reason": f"{type(error).__name__}: {error}"}
+                        initial_alignment_ms = 1000 * (time.perf_counter() - alignment_started)
+                        initial_alignment.update(captured_ns=observation.captured_ns, elapsed_ms=initial_alignment_ms)
+                        write_json(folder / "initial_alignment.json", initial_alignment)
+                        if self.cancel.is_set() or self.closing.is_set():
+                            raise InterruptedError("Initial scene check cancelled")
+                        if not initial_alignment["passed"]:
+                            setup_abort_reason = "initial_scene_mismatch"
+                            recorder.write({"step": 0, "step_status": "setup_rejected",
+                                            "captured_ns": observation.captured_ns,
+                                            "state": observation.state.tolist(),
+                                            "initial_alignment": initial_alignment}, observation)
+                            self.signal("stop")
+                            self._journal("initial_scene_rejected", report=initial_alignment)
+                            raise InterruptedError("Start layout changed; no policy action executed")
+                        self._state("RUNNING", "Start layout checked; running policy")
+                if self.cancel.is_set() or self.closing.is_set():
+                    raise InterruptedError("Initial observation cancelled")
                 prediction_started = time.perf_counter()
                 phase = "infer"
                 policy_started = True
@@ -1223,6 +1282,7 @@ class DeploymentSession:
                        "work_ms": work_ms, "deadline_miss": work_ms>1000/self.config.target_hz}
                 if step == 0:
                     row["initial_snapshot_ms"] = initial_snapshot_ms
+                    row["initial_alignment_ms"] = initial_alignment_ms
                 with self.lock:
                     self.rows.append(row)
                 phase = "record"
@@ -1355,6 +1415,7 @@ class DeploymentSession:
             if folder and outcome in {"success", "failure"}:
                 result = {"id": self._sequence, "attempt_id": self._attempt_sequence,
                           **attempt_compute,
+                          "initial_alignment": initial_alignment,
                           "trial_context": trial_context, "trial_identity": trial_identity,
                           "continuous_rollout_indices": self._continuous_rollout_indices,
                           "start_home_report": self._json_safe(start_home_report),
@@ -1384,8 +1445,10 @@ class DeploymentSession:
                 if trial_context:
                     aborted = {"id": self._sequence, "attempt_id": self._attempt_sequence,
                                **attempt_compute,
-                               "outcome": "aborted", "outcome_source": "operator_abort",
-                               "directory": folder.name, "abort_reason": outcome or "cancelled",
+                               "outcome": "aborted", "outcome_source": ("automatic_setup_rejection"
+                                                                        if setup_abort_reason else "operator_abort"),
+                               "directory": folder.name, "abort_reason": setup_abort_reason or outcome or "cancelled",
+                               "initial_alignment": initial_alignment,
                                "trial_context": trial_context, "trial_identity": trial_identity,
                                "policy_started": policy_started,
                                "executed_actions": sum(row.get("step_status") == "executed" for row in self.rows),
@@ -1467,6 +1530,9 @@ class DeploymentSession:
                     result["outcome_home"] = "cancelled"
                 write_json(folder / "result.json", result)
             self._ready_after_stop()
+            if setup_abort_reason:
+                self.events.put({"kind": "warning", "detail":
+                    "Start layout did not match after Home. No policy action ran; images and check results were saved. Align the scene and retry."})
             self.save()
 
     def close(self):

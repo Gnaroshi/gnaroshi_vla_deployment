@@ -41,6 +41,7 @@ class DeploymentGUI:
         self.extension_panels = []
         self._extension_errors = {}
         extra_tabs = tuple(extra_tabs or ())
+        self._workflow_titles = {"Match layout", *(title for title, _factory in extra_tabs)}
         builtins = (("Policy",) if reload_fields else ()) + ("Rollouts", "Match layout", "Notes", "Config", "Devices", "Settings", "Details")
         titles = builtins + tuple(title for title, _factory in extra_tabs)
         if any(not isinstance(title, str) or not title.strip() for title in titles) or len(set(titles)) != len(titles):
@@ -284,6 +285,7 @@ class DeploymentGUI:
                 outer = inner = ttk.Frame(tabs, padding=SPACE["control"])
             tabs.add(outer, text=title)
             frames[title], tab_frames[title] = inner, outer
+        self._tab_frames = tab_frames
         results, notes, config, devices, settings, details = (frames[title] for title in ("Rollouts", "Notes", "Config", "Devices", "Settings", "Details"))
         self.config_tab = tab_frames["Config"]
         self.settings_tab = tab_frames["Settings"]
@@ -891,6 +893,15 @@ class DeploymentGUI:
         else:
             self.measurement_panel.grid()
         self._schedule_layout()
+
+    def show_tab(self, title):
+        """Navigate to an operator workflow without loading policy or moving devices."""
+        if self.closing or title not in self._tab_frames:
+            return False
+        self.main_pane.expand("second", persist=False)
+        self.tabs.select(self._tab_frames[title])
+        self._schedule_layout()
+        return True
 
     def _layout_workspace(self):
         self._layout_job = None
@@ -1725,7 +1736,10 @@ class DeploymentGUI:
         self.session.record_event("reload_requested", selection=selection)
         previous, previous_config = self.session, copy.deepcopy(self.session.config)
         self._reload_in_progress = True
+        previous_view = self.tabs.tab(self.tabs.select(), "text") if self.tabs.select() else None
         self._set_checkpoint_expanded(False)
+        if previous_view in getattr(self, "_workflow_titles", ()):
+            self.show_tab(previous_view)
         self.load_error.grid_remove()
         self.status.set("Closing the current session before loading the selected checkpoint")
         self._reload_thread = threading.Thread(target=self._reload, args=(previous, selection, previous_config),
@@ -1784,6 +1798,7 @@ class DeploymentGUI:
                 self._reload_events.put(("done",))
 
     def _bind_session(self, session):
+        previous_view = self.tabs.tab(self.tabs.select(), "text") if self.tabs.select() else None
         for panel in getattr(self, "extension_panels", ()):
             self._panel_call(panel, "refresh", self.session.latest)
         session.set_continuous_rollout_indices(self.continuous_rollout_indices.get())
@@ -1799,6 +1814,8 @@ class DeploymentGUI:
         self.record_video.set(session.config.record_video)
         self._apply_selection(session.config.metadata.get("reload_selection", {}))
         self._set_checkpoint_expanded(False)
+        if previous_view in getattr(self, "_workflow_titles", ()):
+            self.show_tab(previous_view)
         self.notes.configure(state="normal")
         self.notes.delete("1.0", "end")
         self._rows_seen, self._details_seen = None, None
