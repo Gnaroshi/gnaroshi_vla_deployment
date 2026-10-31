@@ -323,11 +323,16 @@ class Sessions(unittest.TestCase):
         session.start_rollout()
         self.wait(lambda:session.state=="WAITING_OUTCOME")
         session.signal("success")
-        self.wait(lambda:session.state=="RECOVERY_REQUIRED")
+        # Motion is blocked as soon as the fault is raised; result persistence
+        # finishes afterwards on the same worker. Inspect its completed record.
+        self.wait(lambda:session.state=="RECOVERY_REQUIRED" and not session._rollout_active)
         result=session.results[0]
         self.assertEqual(result["outcome"],"success")
         self.assertEqual(result["outcome_home"],"error")
         self.assertEqual(result["outcome_home_failure"]["category"],"home_position_unconfirmed")
+        saved=json.loads((session.folder/result["directory"]/"result.json").read_text())
+        self.assertEqual(saved["outcome"],"success")
+        self.assertEqual(saved["outcome_home"],"error")
         self.assertFalse(session.start_rollout())
 
     def test_stop_during_inference_never_applies_late_action_or_homes(self):
