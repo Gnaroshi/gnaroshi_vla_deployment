@@ -1,6 +1,7 @@
 """Atomic session records and videos from the exact observations used by policy."""
 from __future__ import annotations
 import json
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -63,6 +64,29 @@ class RolloutRecorder:
         self.image_shapes = {}
         self.closed = False
         self.error = None
+        self.initial_snapshot = None
+
+    def save_initial(self, observation, *, trial_context=None, camera_serials=None, identity=None):
+        """Preserve the exact first policy input, independently of video encoding."""
+        if self.initial_snapshot is not None:
+            return self.initial_snapshot
+        from PIL import Image
+        self.prepare(observation.images)
+        images = {}
+        for role, frame in observation.images.items():
+            path = self.folder / f"initial_{role}.png"
+            Image.fromarray(frame).save(path, format="PNG", compress_level=1)
+            images[role] = {"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                            "width": int(frame.shape[1]), "height": int(frame.shape[0])}
+        payload = {"schema_version": 1, "stage": "after_home_before_first_action",
+                   "captured_ns": observation.captured_ns,
+                   "captured_monotonic_ns": observation.captured_monotonic_ns,
+                   "state": observation.state.tolist(), "camera_metadata": observation.camera_metadata,
+                   "camera_serials": dict(camera_serials or {}), "images": images,
+                   "trial_context": trial_context or {}, "identity": identity or {}}
+        write_json(self.folder / "initial_state.json", payload)
+        self.initial_snapshot = payload
+        return payload
 
     @property
     def health(self):

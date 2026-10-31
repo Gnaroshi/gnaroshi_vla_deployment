@@ -74,6 +74,86 @@ class Sessions(unittest.TestCase):
         self.assertEqual(len(session.results),1)
         self.assertEqual(len(list(session.folder.glob("rollout_*"))),1)
 
+    def test_experiment_context_and_exact_initial_input_survive_outcome_and_delete(self):
+        from PIL import Image
+        import hashlib
+        session = self.make(steps=1)
+        context = {"calibration": {"campaign_id": "test", "trial_id": "slot-1"}}
+        self.assertTrue(session.set_trial_context(context))
+        context["calibration"]["trial_id"] = "mutated"
+        session.start_rollout()
+        self.wait(lambda: session.state == "WAITING_OUTCOME")
+        self.assertFalse(session.set_trial_context({}))
+        session.signal("success")
+        self.wait(lambda: session.state == "READY")
+        record = session.results[0]
+        self.assertEqual(record["trial_context"]["calibration"]["trial_id"], "slot-1")
+        folder = session.folder / record["directory"]
+        snapshot = json.loads((folder / "initial_state.json").read_text())
+        row = json.loads((folder / "steps.jsonl").read_text().splitlines()[0])
+        self.assertEqual(snapshot["state"], row["state"])
+        self.assertEqual(snapshot["captured_ns"], row["captured_ns"])
+        self.assertEqual(snapshot["trial_context"], record["trial_context"])
+        self.assertEqual(snapshot["stage"], "after_home_before_first_action")
+        for role, item in snapshot["images"].items():
+            path = folder / item["path"]
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), item["sha256"])
+            self.assertEqual(Image.open(path).size, (item["width"], item["height"]))
+        session.delete_previous()
+        self.assertEqual(session.results, [])
+        self.assertTrue(session.attempt_records[0]["deleted"])
+        self.assertTrue(folder.exists())
+        self.assertTrue(json.loads((folder / "result.json").read_text())["deleted"])
+
+    def test_calibration_stop_and_retry_retain_attempts_without_inflating_failure_count(self):
+        session = self.make(steps=1)
+        for number, outcome in enumerate(("stop", "retry", "failure")):
+            session.set_trial_context({"calibration": {"campaign_id": "test", "trial_id": f"slot-{number}"}})
+            session.start_rollout()
+            self.wait(lambda: session.state == "WAITING_OUTCOME")
+            session.signal(outcome)
+            self.wait(lambda: session.state == "READY")
+        self.assertEqual([row["outcome"] for row in session.attempt_records], ["aborted", "aborted", "failure"])
+        self.assertEqual(len(session.results), 1)
+        data = json.loads((session.folder / "results.json").read_text())
+        self.assertEqual(data["failures"], 1)
+        self.assertEqual(len(data["attempts"]), 3)
+        self.assertEqual([row["attempt_id"] for row in data["attempts"]], [1, 2, 3])
+        for row in data["attempts"]:
+            self.assertTrue((session.folder / row["directory"] / "initial_state.json").exists())
+
+    def test_trial_context_rejects_unbounded_or_nonfinite_records(self):
+        session = self.make()
+        for context in ([1], {"large": "x" * 65536}, {"value": float("nan")}):
+            with self.assertRaises(ValueError):
+                session.set_trial_context(context)
+
+    def test_compute_accounting_includes_inference_before_failed_apply(self):
+        class FailedApply(MockEmbodiment):
+            def apply(self, _prediction):
+                raise RuntimeError("Mock action rejected before command")
+        session = self.make(embodiment=FailedApply())
+        session.start_rollout()
+        self.wait(lambda: session.state == "ERROR")
+        result = session.results[0]
+        self.assertEqual(result["outcome"], "failure")
+        self.assertEqual(result["steps"], 0)
+        self.assertEqual(result["attempt_backbone_calls"], 1)
+        self.assertTrue(result["backbone_count_complete"])
+        self.assertEqual(result["policy_inferences_completed"], 1)
+
+    def test_unknown_failed_inference_calls_are_not_invented_as_zero(self):
+        class FailedInfer(MockPolicy):
+            def infer(self, _observation, _instruction):
+                raise RuntimeError("Mock policy disconnected")
+        session = self.make(policy=FailedInfer())
+        session.start_rollout()
+        self.wait(lambda: session.state == "ERROR")
+        result = session.results[0]
+        self.assertIsNone(result["attempt_backbone_calls"])
+        self.assertFalse(result["backbone_count_complete"])
+        self.assertEqual(result["policy_inferences_started"], 1)
+
     def test_discarded_attempts_do_not_consume_saved_numbers_by_default(self):
         session=self.make(steps=1)
         for outcome in ("success","stop","retry","failure"):

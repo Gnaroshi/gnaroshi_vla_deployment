@@ -4,6 +4,7 @@ from collections import deque
 import copy
 from pathlib import Path
 import json
+import math
 import queue
 import shutil
 import threading
@@ -30,6 +31,9 @@ class DeploymentSession:
         self.state = "CONNECTING"
         self.request = None
         self.results, self.rows = [], []
+        self.attempt_records = []
+        self._trial_context = {}
+        self._pending_trial_context = {}
         self.latest = None
         self.error = None
         self.error_detail = None
@@ -483,8 +487,31 @@ class DeploymentSession:
                     self.events.put({"kind": "warning", "detail": self.operator_health["reason"] or "Session is not ready to start"})
                 return False
             # Reserve the state before queueing: double-click cannot queue two homes.
+            self._pending_trial_context = copy.deepcopy(self._trial_context)
             self.state = "STARTING"
         self.commands.put("start")
+        return True
+
+    @property
+    def trial_context(self):
+        with self.lock:
+            return copy.deepcopy(self._trial_context)
+
+    def set_trial_context(self, context):
+        """Attach a bounded operator-owned experiment identity before Start."""
+        context = {} if context is None else context
+        if not isinstance(context, dict):
+            raise ValueError("Trial context must be an object")
+        encoded = json.dumps(context, allow_nan=False, ensure_ascii=False)
+        if len(encoded.encode()) > 65536:
+            raise ValueError("Trial context must be smaller than 64 KiB; store images separately")
+        clean = json.loads(encoded)
+        with self.lock:
+            if (self.state not in {"SELECTING", "READY", "CONNECTING"}
+                    or self._rollout_active or self._home_active or self.closing.is_set()):
+                return False
+            self._trial_context = clean
+            self._journal("trial_context_changed", trial_context=clean)
         return True
 
     def signal(self, action):
@@ -757,7 +784,7 @@ class DeploymentSession:
             if notes is not None:
                 self._notes = notes
             successes = sum(r["outcome"] == "success" for r in self.results)
-            payload = {"results": list(self.results), "successes": successes,
+            payload = {"results": list(self.results), "attempts": list(self.attempt_records), "successes": successes,
                        "failures": sum(r["outcome"] == "failure" for r in self.results),
                        "success_rate": successes/len(self.results) if self.results else None,
                        "notes": self._notes, "automatic_notes": list(self._automatic_notes),
@@ -796,8 +823,18 @@ class DeploymentSession:
             folder = (self.folder / deleted["directory"]).resolve()
             if folder.parent != self.folder:
                 raise RuntimeError("Result path escaped session")
-            shutil.rmtree(folder)
-            self._journal("delete_result", rollout_id=deleted["id"])
+            if deleted.get("trial_context"):
+                # The visible result can be deleted, but an experiment must not
+                # silently lose a failed or otherwise inconvenient trial.
+                deleted.update(deleted=True, deleted_ns=time.time_ns())
+                write_json(folder / "result.json", deleted)
+                self.attempt_records = [deleted
+                    if row.get("directory") == deleted["directory"] else row for row in self.attempt_records]
+            else:
+                self.attempt_records = [row for row in self.attempt_records
+                    if row.get("directory") != deleted["directory"]]
+                shutil.rmtree(folder)
+            self._journal("delete_result", rollout_id=deleted["id"], evidence_retained=bool(deleted.get("trial_context")))
             self.save()
             return True
 
@@ -1073,6 +1110,17 @@ class DeploymentSession:
         phase, step = "start", None
         observation = prediction = None
         start_home_report = None
+        policy_started = False
+        policy_inferences_started = policy_inferences_completed = 0
+        observed_backbone_calls = 0
+        backbone_count_complete = True
+        trial_context = copy.deepcopy(self._pending_trial_context)
+        trial_identity = {"task": self.config.task, "method": self.config.method,
+                          "state_layout": self.config.metadata.get("state_layout", self.embodiment.metadata.get("state")),
+                          "instruction": self.config.instruction,
+                          "selection_fingerprint": self.config.metadata.get("selection_fingerprint"),
+                          "selection_identity": copy.deepcopy(self.config.metadata.get("selection_identity")),
+                          "target_hz": self.config.target_hz, "max_steps": self.config.max_steps}
         self.rows = []
         # Preserve a stop issued after Start but before worker dispatch.
         with self.lock:
@@ -1082,6 +1130,20 @@ class DeploymentSession:
             if not already_cancelled:
                 self.request = None
         if already_cancelled:
+            if trial_context:
+                self._reserve_rollout_number()
+                aborted_folder = self.folder / f"rollout_{self._sequence:04d}_{uuid.uuid4().hex[:6]}"
+                aborted_folder.mkdir()
+                aborted = {"id": self._sequence, "attempt_id": self._attempt_sequence,
+                           "outcome": "aborted", "outcome_source": "operator_abort", "directory": aborted_folder.name,
+                           "abort_reason": self.request or "cancelled_before_prepare", "steps": 0,
+                           "trial_context": trial_context, "trial_identity": trial_identity,
+                           "policy_started": False, "executed_actions": 0,
+                           "attempt_backbone_calls": 0, "backbone_count_complete": True, **summary([])}
+                write_json(aborted_folder / "attempt.json", aborted)
+                with self.lock:
+                    self.attempt_records.append(aborted)
+                self.save()
             self._ready_after_stop()
             return
         self._update_storage_health(force=True)
@@ -1127,10 +1189,21 @@ class DeploymentSession:
                 observation, capture_ms = self._preview()
                 if step==0:
                     phase = "record"
-                    recorder.prepare(observation.images)
+                    snapshot_started = time.perf_counter()
+                    recorder.save_initial(observation, trial_context=trial_context,
+                                          camera_serials=camera_serials, identity=trial_identity)
+                    initial_snapshot_ms = 1000 * (time.perf_counter() - snapshot_started)
                 prediction_started = time.perf_counter()
                 phase = "infer"
+                policy_started = True
+                policy_inferences_started += 1
                 prediction = self._policy_operation(self.policy.infer, observation, self.config.instruction)
+                policy_inferences_completed += 1
+                delta = prediction.telemetry.get("backbone_call_delta")
+                if isinstance(delta, (int, float)) and not isinstance(delta, bool) and math.isfinite(delta) and delta >= 0:
+                    observed_backbone_calls += delta
+                else:
+                    backbone_count_complete = False
                 policy_ms = 1000*(time.perf_counter()-prediction_started)
                 if self.cancel.is_set():
                     self._journal("cancelled_prediction", step=step,
@@ -1148,6 +1221,8 @@ class DeploymentSession:
                        "command_monotonic_s": command_end, "capture_ms": capture_ms,
                        "policy_ms": policy_ms, "command_ms": 1000*(command_end-command_started),
                        "work_ms": work_ms, "deadline_miss": work_ms>1000/self.config.target_hz}
+                if step == 0:
+                    row["initial_snapshot_ms"] = initial_snapshot_ms
                 with self.lock:
                     self.rows.append(row)
                 phase = "record"
@@ -1208,6 +1283,13 @@ class DeploymentSession:
                 self._stop_failed=True
             self._journal("rollout_error", detail=self.error)
         finally:
+            count_complete = backbone_count_complete and policy_inferences_started == policy_inferences_completed
+            attempt_compute = {"policy_started": policy_started,
+                               "policy_inferences_started": policy_inferences_started,
+                               "policy_inferences_completed": policy_inferences_completed,
+                               "observed_backbone_calls": observed_backbone_calls,
+                               "backbone_count_complete": count_complete,
+                               "attempt_backbone_calls": observed_backbone_calls if count_complete else None}
             accepted_stop_outcome = self.request if failure is None and self.request in {"success", "failure"} else None
             if not self._wait_for_stops():
                 fault = getattr(self.embodiment, "recovery_error", None)
@@ -1272,6 +1354,8 @@ class DeploymentSession:
             outcome = accepted_stop_outcome or ("failure" if failure is not None else self.request)
             if folder and outcome in {"success", "failure"}:
                 result = {"id": self._sequence, "attempt_id": self._attempt_sequence,
+                          **attempt_compute,
+                          "trial_context": trial_context, "trial_identity": trial_identity,
                           "continuous_rollout_indices": self._continuous_rollout_indices,
                           "start_home_report": self._json_safe(start_home_report),
                           "outcome": outcome, "directory": folder.name,
@@ -1294,11 +1378,29 @@ class DeploymentSession:
                 write_json(folder / "result.json", result)
                 with self.lock:
                     self.results.append(result)
+                    self.attempt_records.append(result)
                 self.save()
             elif folder:
-                shutil.rmtree(folder)
-                self._journal("discard_rollout", directory=folder.name, reason=outcome,
-                              rollout_id=self._sequence, attempt_id=self._attempt_sequence)
+                if trial_context:
+                    aborted = {"id": self._sequence, "attempt_id": self._attempt_sequence,
+                               **attempt_compute,
+                               "outcome": "aborted", "outcome_source": "operator_abort",
+                               "directory": folder.name, "abort_reason": outcome or "cancelled",
+                               "trial_context": trial_context, "trial_identity": trial_identity,
+                               "policy_started": policy_started,
+                               "executed_actions": sum(row.get("step_status") == "executed" for row in self.rows),
+                               "target_hz": self.config.target_hz, "max_steps": self.config.max_steps,
+                               "camera_serials": camera_serials, "start_home_report": self._json_safe(start_home_report),
+                               "recording": dict(self._recording_status), **summary(self.rows)}
+                    write_json(folder / "attempt.json", aborted)
+                    with self.lock:
+                        self.attempt_records.append(aborted)
+                    self._journal("trial_aborted", **aborted)
+                    self.save()
+                else:
+                    shutil.rmtree(folder)
+                    self._journal("discard_rollout", directory=folder.name, reason=outcome,
+                                  rollout_id=self._sequence, attempt_id=self._attempt_sequence)
             if self.closing.is_set():
                 return
             if recoverable_error is not None:

@@ -11,6 +11,7 @@ src/gnaroshi_deployment/
   gui.py                   관측 화면, 버튼, 설정, notes와 결과
   records.py               JSON/JSONL, 영상, latency/실제 command Hz
   reference.py             호출 프로젝트가 제공하는 시작 장면 탐색
+  scene_matching.py        저장된 rollout의 첫 장면과 현재 배치 비교
   desktop.py               현재 사용자의 desktop 환경 탐색
   adapters/mock.py         장치·모델 없이 실행 가능한 예제
   adapters/ur5e.py          모델과 독립적인 hardware adapter
@@ -112,6 +113,39 @@ Home은 선택·로딩·실행·정지·복구 중에는 비활성화된다. UR5
 열거나 activation하지 않는다. Stop/Exit로 취소할 수 있다. 다른 embodiment는 optional
 `home_idle(cancel)`을 제공하면 같은 분리가 적용되며, 없으면 기존 `home(cancel)`을 사용한다.
 단축키는 입력창·설정 선택·notes 편집 중에는 실행되지 않는다.
+
+### 저장된 시작 장면으로 배치 맞추기
+
+**Match layout**에서 결과 폴더를 선택하고 task/method/checkpoint/rollout으로 기준을 찾는다.
+어느 방법의 rollout이든 기준으로 사용할 수 있다. 현재 robot home과 물체 배치를 먼저
+준비하고, 기준 이미지에서 물체별 영역을 지정한다. Overlay / Side by side로 확인하면서
+픽셀 이동량·일치 신뢰도·로봇 상태 차이를 확인하고 **Use for next rollout**으로 연결한다.
+이 탭은 카메라 관측만 읽으며 로봇을 움직이거나 rollout을 시작하지 않는다.
+
+영역 기반 CPU 영상 매칭이며 자동 semantic object detector가 아니다. 카메라·task·영상 크기가
+다르거나 반복 무늬·가림으로 불명확하면 일치로 단정하지 않는다. 영상 평면의 일치는
+3D pose·접촉 상태가 같다는 보장이 아니다. Start가 home을 다시 수행하므로 실제 첫 입력을
+최종 근거로 확인한다. 기존 MP4의 첫 프레임은 손실 압축된 legacy reference라고 표시한다.
+
+새 rollout은 home 후 첫 action **이전의 실제 policy 입력**을 `initial_state.json`과
+`initial_<camera role>.png`에 저장한다. state, camera identity, 이미지 SHA256, 선택한 기준
+장면과 실험 context를 포함한다. 영상 녹화를 꺼도 첫 관측은 남으며 저장 시간은 첫 step의
+`initial_snapshot_ms`로 분리한다. 학습 예시 이미지 탐색 기능도 계속 제공한다.
+`attempt_backbone_calls`는 action 적용 실패나 중단 전에 이미 반환된 추론의 호출도 포함한다.
+추론 응답을 받지 못해 총량을 알 수 없으면 null과 `backbone_count_complete=false`로 남긴다.
+기존 실행된 command 기준 측정치와 구분하며, 알 수 없는 비용을 0회로 추정하지 않는다.
+
+프로젝트는 `DeploymentGUI(..., results_root=..., extra_tabs=[(title, factory)])`로 전용 workflow를
+추가할 수 있다. factory는 `(parent, app)`을 받아 `refresh(observation)`, `bind_session(session)`,
+`before_start()`와 `close()`를 선택적으로 제공한다. `before_start`가 False/오류이면 Start를 막는다.
+`app.apply_selection_draft`는 선택만 검증하고, `app.set_trial_context`는 idle에서 context를
+설정한다. 둘 다 policy load나 motion을 자동 실행하지 않는다. checkpoint 교체는 context를 해제한다.
+
+실험 context가 연결된 attempt는 일반 Stop/Retry와 달리 중단 기록·영상도 보존한다.
+`results.json`의 `attempts`에는 완료·중단·삭제 표시까지 남는다. 일반 success/failure 집계에는
+확정 outcome만 포함하며, 프로젝트 보정 workflow가 중단 사유를 별도로 분류한다. 실험 결과의
+Delete는 화면에서 숨기되 원본 증거를 보존한다는 확인 문구를 표시한다. 일반 rollout 삭제는
+기존처럼 파일을 삭제한다. 어느 경우에도 Stop/Retry가 home이나 새 motion을 실행하지 않는다.
 
 ### 화면과 실패 원인
 

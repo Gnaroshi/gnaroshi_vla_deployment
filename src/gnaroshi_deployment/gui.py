@@ -18,6 +18,7 @@ from .records import summary, write_json
 from .session import DeploymentSession
 from .desktop import open_local_path, recorded_video
 from .workspace import WorkspacePreferences, ResizablePane, clamp_window_geometry, geometry_string
+from .scene_matching import SceneMatchingPanel
 
 
 # Semantic working palette, following Gnaroshi MDS ui-ux guidance. Device and
@@ -34,8 +35,16 @@ SPACE = {"small": 4, "button_y": 6, "control": 8, "group": 12, "section": 16}
 class DeploymentGUI:
     def __init__(self, root, session, *, reload_fields=None, reload_factory=None,
                  selection_resolver=None, config_loader=None, config_saver=None, config_directory=None,
-                 preferences_path=None):
+                 preferences_path=None, results_root=None, extra_tabs=None):
         self.root, self.session = root, session
+        self._trial_context = {}
+        self.extension_panels = []
+        self._extension_errors = {}
+        extra_tabs = tuple(extra_tabs or ())
+        builtins = (("Policy",) if reload_fields else ()) + ("Rollouts", "Match layout", "Notes", "Config", "Devices", "Settings", "Details")
+        titles = builtins + tuple(title for title, _factory in extra_tabs)
+        if any(not isinstance(title, str) or not title.strip() for title in titles) or len(set(titles)) != len(titles):
+            raise ValueError("GUI tab names must be nonempty and distinct")
         self.reload_fields = tuple(reload_fields or ())
         self.reload_factory = reload_factory
         self.selection_resolver = selection_resolver
@@ -260,14 +269,14 @@ class DeploymentGUI:
         ttk.Label(self.view_selector, text="View").grid(row=0, column=0, padx=(0,SPACE["control"]))
         self.selected_view = tk.StringVar(value="Rollouts")
         self.view_picker = ttk.Combobox(self.view_selector, textvariable=self.selected_view,
-                                       values=(("Policy",) if self.reload_fields else ())+("Rollouts","Notes","Config","Devices","Settings","Details"), state="readonly", width=12)
+                                       values=titles, state="readonly", width=12)
         self.view_picker.grid(row=0, column=1, sticky="ew")
         tabs = self.tabs = ttk.Notebook(self.inspector_content)
         tabs.grid(row=2, sticky="nsew")
         self.view_picker.bind("<<ComboboxSelected>>", lambda _event:tabs.select(self.view_picker.current()))
         tabs.bind("<<NotebookTabChanged>>", self._view_changed)
         frames, tab_frames = {}, {}
-        for title in (("Policy",) if self.reload_fields else ())+("Rollouts", "Notes", "Config", "Devices", "Settings", "Details"):
+        for title in titles:
             if title in {"Rollouts", "Config", "Devices", "Settings"}:
                 outer = ttk.Frame(tabs)
                 inner = self._scrollable_content(outer, fill_height=title=="Rollouts")
@@ -461,6 +470,11 @@ class DeploymentGUI:
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._rows_seen = None
         self._details_seen = None
+        self.scene_tab = tab_frames["Match layout"]
+        self.scene_panel = SceneMatchingPanel(frames["Match layout"], self, results_root=results_root)
+        self.extension_panels.append(self.scene_panel)
+        for title, factory in extra_tabs:
+            self.extension_panels.append(factory(frames[title], self))
         self._layout_workspace()
         session.start()
         self._install_wheel_routes()
@@ -867,7 +881,7 @@ class DeploymentGUI:
         self._schedule_layout()
 
     def _view_changed(self, _event=None):
-        if not self.tabs.select():
+        if self.closing or not self.tabs.select():
             return
         title=self.tabs.tab(self.tabs.select(),"text")
         self.selected_view.set(title)
@@ -1517,6 +1531,55 @@ class DeploymentGUI:
                     selection[key]=value
         return selection
 
+    @property
+    def trial_context(self):
+        return copy.deepcopy(getattr(self, "_trial_context", {}))
+
+    def set_trial_context(self, context):
+        """Attach an explicit experiment draft; never arm or move the robot."""
+        if self.closing or self._reload_in_progress:
+            return False
+        merged = {} if context is None else {**self.trial_context, **copy.deepcopy(context)}
+        merged = {key: value for key, value in merged.items() if value is not None}
+        if not self.session.set_trial_context(merged):
+            return False
+        self._trial_context = merged
+        return True
+
+    def apply_selection_draft(self, selection):
+        """Validate a project selection without loading it or starting motion."""
+        if self.closing or self._reload_in_progress or self.session.state not in {"READY", "SELECTING"}:
+            return False
+        try:
+            resolved = copy.deepcopy(selection)
+            if self.selection_resolver:
+                resolved = self.selection_resolver(resolved, "load")
+            self._apply_selection(resolved)
+            return True
+        except Exception as error:
+            self._selection_error("Selection", error)
+            return False
+
+    def _panel_call(self, panel, method, *args):
+        callback = getattr(panel, method, None)
+        if callback is None:
+            return True
+        key = f"{type(panel).__name__}.{method}"
+        try:
+            value = callback(*args)
+            self._extension_errors.pop(key, None)
+            if value is False and method == "before_start":
+                feedback = getattr(panel, "message", None) or getattr(panel, "status", None)
+                if feedback is not None:
+                    self.status.set(feedback.get())
+            return value
+        except Exception as error:
+            self._extension_errors[key] = str(error)
+            self._event_detail = f"{key}: {error}"
+            if method == "before_start":
+                self.status.set(f"Experiment setup needs attention: {error}")
+            return False
+
     def _apply_selection(self, selection):
         if not isinstance(selection, dict):
             raise TypeError("Selection callbacks must return a dictionary")
@@ -1721,8 +1784,11 @@ class DeploymentGUI:
                 self._reload_events.put(("done",))
 
     def _bind_session(self, session):
+        for panel in getattr(self, "extension_panels", ()):
+            self._panel_call(panel, "refresh", self.session.latest)
         session.set_continuous_rollout_indices(self.continuous_rollout_indices.get())
         self.session = session
+        self._trial_context = {}
         self._last_displayed_state = None
         self.root.title(f"{session.config.method} | {session.config.task} deployment")
         self.heading_label.configure(text=self._display_task())
@@ -1761,6 +1827,8 @@ class DeploymentGUI:
         self.show_reference()
         self.state.set("CONNECTING")
         self.status.set("Opening selected policy and embodiment")
+        for panel in getattr(self, "extension_panels", ()):
+            self._panel_call(panel, "bind_session", session)
         session.start()
 
     def _reload_updates(self):
@@ -2058,6 +2126,9 @@ class DeploymentGUI:
     def start(self):
         if self.closing or self._reload_in_progress:
             return False
+        for panel in getattr(self, "extension_panels", ()):
+            if self._panel_call(panel, "before_start") is False:
+                return False
         if self.session.start_rollout():
             self.status.set("Moving to task home, then resetting policy and starting rollout")
             return True
@@ -2119,7 +2190,13 @@ class DeploymentGUI:
     def delete(self):
         if self._playback_busy:
             return False
-        if not self.closing and not self._reload_in_progress and self.session.state=="READY" and self.session.results and messagebox.askyesno("Delete latest saved rollout?",f"Delete rollout {self.session.results[-1]['id']} and its videos?\n\nThis deletes the latest saved rollout, regardless of the selected row.",parent=self.root):
+        if self.closing or self._reload_in_progress or self.session.state != "READY" or not self.session.results:
+            return False
+        latest = self.session.results[-1]
+        prompt = (f"Hide experiment rollout {latest['id']} from this session's visible results?\n\n"
+                  "Its outcome, videos and experiment evidence will be retained for audit. Calibration cannot silently exclude it."
+                  if latest.get("trial_context") else f"Delete rollout {latest['id']} and its videos?\n\nThis deletes the latest saved rollout, regardless of the selected row.")
+        if messagebox.askyesno("Delete latest saved rollout?", prompt, parent=self.root):
             identifier = self.session.results[-1]["id"]
             if self.session.delete_previous():
                 self._annotation_drafts.pop(identifier, None)
@@ -2528,6 +2605,8 @@ class DeploymentGUI:
             rows=list(self.session.rows)
             results=list(self.session.results)
             latest=self.session.latest
+        for panel in getattr(self, "extension_panels", ()):
+            self._panel_call(panel, "refresh", latest)
         health = self._update_device_status(latest)
         policy_metadata = getattr(self.session.policy, "metadata", {})
         if state == "SELECTING":
@@ -2657,6 +2736,8 @@ class DeploymentGUI:
                               "failure_results": [r for r in results if r.get("failure_reason")],
                               "automatic_notes": automatic_notes,
                               "reference_error": self._reference_error,
+                              "experiment_context": self.trial_context,
+                              "extension_errors": getattr(self, "_extension_errors", {}),
                               "measurements": stats}, indent=2)
         self._details_seen=self._update_readonly_text(self.details,details,self._details_seen)
         if latest:
@@ -2671,6 +2752,8 @@ class DeploymentGUI:
                 and (self._reload_cleanup_session is None or self._reload_cleanup_session.shutdown_complete)
                 and (self._reload_thread is None or not self._reload_thread.is_alive())
                 and (self._playback_thread is None or not self._playback_thread.is_alive())):
+            for panel in getattr(self, "extension_panels", ()):
+                self._panel_call(panel, "close")
             self.root.destroy()
             return
         self._refresh_job=self.root.after(100,self.refresh)
@@ -2688,6 +2771,8 @@ class DeploymentGUI:
                 self.root.after_cancel(job)
                 setattr(self, job_name, None)
         self.closing=True
+        for panel in getattr(self, "extension_panels", ()):
+            self._panel_call(panel, "prepare_close")
         self._playback_cancel.set()
         self.status_progress.stop()
         for variable,mode,token in self._variable_traces:

@@ -86,6 +86,40 @@ class GUIOperations(unittest.TestCase):
         self.assertFalse(list(session.folder.glob("rollout_*")))
         self.assertIn("Home", self.app.control_hint.cget("text"))
 
+    def test_experiment_tabs_block_invalid_start_and_merge_context_without_motion(self):
+        class Panel:
+            def __init__(self, parent, app):
+                self.app, self.allowed, self.closed = app, False, False
+                ttk.Label(parent, text="Operator experiment setup").pack()
+            def before_start(self):
+                if not self.allowed:
+                    raise ValueError("Choose an experiment slot")
+                return True
+            def refresh(self, _latest=None):
+                pass
+            def close(self):
+                self.closed = True
+        session = self.launch(extra_tabs=[("Experiment", Panel)])
+        self.assertIn("Match layout", self.app.view_picker.cget("values"))
+        self.assertIn("Experiment", self.app.view_picker.cget("values"))
+        self.assertTrue(self.app.set_trial_context({"scene_match": {"layout_id": "placement-1"}}))
+        self.assertTrue(self.app.set_trial_context({"calibration": {"trial_id": "slot-1"}}))
+        self.assertEqual(set(self.app.trial_context), {"scene_match", "calibration"})
+        self.assertFalse(self.app.start())
+        self.assertEqual(session.embodiment.home_count, 0)
+        self.assertIn("Choose an experiment slot", self.app.status.get())
+        self.app.extension_panels[-1].allowed = True
+        self.assertTrue(self.app.start())
+        self.wait(lambda: session.state == "RUNNING")
+        self.assertFalse(self.app.set_trial_context(None))
+        self.app.signal("stop")
+        self.wait(lambda: session.state == "READY")
+        self.assertEqual(session.attempt_records[0]["trial_context"], self.app.trial_context)
+        self.assertTrue(self.app.set_trial_context({"calibration": None}))
+        self.assertEqual(set(self.app.trial_context), {"scene_match"})
+        self.assertTrue(self.app.set_trial_context(None))
+        self.assertEqual(session.trial_context, {})
+
     def test_home_shortcut_rejects_modifiers_text_fields_and_physical_key_repeat(self):
         session = self.launch()
         for widget in (self.app.notes, self.app.hz_entry, self.app.steps_entry, ttk.Combobox(self.root), ttk.Spinbox(self.root)):
